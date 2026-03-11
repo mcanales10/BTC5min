@@ -440,33 +440,27 @@ def find_best_fast_market(markets):
 # =============================================================================
 
 def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
-    """Get price momentum from Binance public API.
-    Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
-    """
-    url = (
-        f"https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
-    )
+    """Get price momentum from Coinbase API (more reliable on cloud hosts)."""
+
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
+
     result = _api_request(url)
+
     if not result or isinstance(result, dict):
         return None
 
     try:
-        # Kline format: [open_time, open, high, low, close, volume, ...]
-        candles = result
-        if len(candles) < 2:
-            return None
+        candles = result[:lookback_minutes]
 
-        price_then = float(candles[0][1])   # open of oldest candle
-        price_now = float(candles[-1][4])    # close of newest candle
+        price_then = float(candles[-1][4])
+        price_now = float(candles[0][4])
+
         momentum_pct = ((price_now - price_then) / price_then) * 100
         direction = "up" if momentum_pct > 0 else "down"
 
         volumes = [float(c[5]) for c in candles]
         avg_volume = sum(volumes) / len(volumes)
-        latest_volume = volumes[-1]
-
-        # Volume ratio: latest vs average (>1 = above average activity)
+        latest_volume = volumes[0]
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
 
         return {
@@ -479,25 +473,9 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
             "volume_ratio": volume_ratio,
             "candles": len(candles),
         }
-    except (IndexError, ValueError, KeyError):
+
+    except Exception:
         return None
-
-
-COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
-
-
-def get_momentum(asset="BTC", source="binance", lookback=5):
-    """Get price momentum from configured source."""
-    if source == "binance":
-        symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
-        return get_binance_momentum(symbol, lookback)
-    elif source == "coingecko":
-        print("  ⚠️  CoinGecko free tier doesn't provide candle data — switch to binance")
-        print("  Run: python fastloop_trader.py --set signal_source=binance")
-        return None
-    else:
-        return None
-
 
 # =============================================================================
 # Import & Trade
