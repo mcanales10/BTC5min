@@ -20,6 +20,7 @@ import sys
 import json
 import math
 import argparse
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -505,6 +506,7 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
     else:
         return None
 
+
 # =============================================================================
 # Import & Trade
 # =============================================================================
@@ -606,6 +608,15 @@ def calculate_position_size(max_size, smart_sizing=False):
 # =============================================================================
 # Main Strategy Logic
 # =============================================================================
+
+def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
+                        smart_sizing=False, quiet=False):
+    """Run one cycle of the fast_market trading strategy."""
+
+    def log(msg, force=False):
+        """Print unless quiet mode is on. force=True always prints."""
+        if not quiet or force:
+            print(msg)
 
     log("⚡ Simmer FastLoop Trading Skill")
     log("=" * 50)
@@ -951,19 +962,12 @@ def calculate_position_size(max_size, smart_sizing=False):
         print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
         print(f"  Action: {'PAPER' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
 
-      # Structured report for automaton (takes priority over fallback in __main__)
+    # Structured report for automaton (takes priority over fallback in __main__)
     if os.environ.get("AUTOMATON_MANAGED"):
         amount = round(position_size, 2) if total_trades > 0 else 0
-        report = {
-            "signals": 1,
-            "trades_attempted": 1,
-            "trades_executed": total_trades,
-            "amount_usd": amount
-        }
-
+        report = {"signals": 1, "trades_attempted": 1, "trades_executed": total_trades, "amount_usd": amount}
         if execution_error:
             report["execution_errors"] = [execution_error]
-
         print(json.dumps({"automaton": report}))
         _automaton_reported = True
 
@@ -1012,31 +1016,30 @@ if __name__ == "__main__":
 
     dry_run = not args.live
 
-import time
+    while True:
+        try:
+            run_fast_market_strategy(
+                dry_run=dry_run,
+                positions_only=args.positions,
+                show_config=args.config,
+                smart_sizing=args.smart_sizing,
+                quiet=args.quiet,
+            )
 
-while True:
-    try:
-        run_fast_market_strategy(
-            dry_run=dry_run,
-            positions_only=args.positions,
-            show_config=args.config,
-            smart_sizing=args.smart_sizing,
-            quiet=args.quiet,
-        )
+            # Fallback report for automaton if the strategy returned early (no signal)
+            # The function emits its own report when it reaches a trade; this covers early exits.
+            if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
+                print(json.dumps({
+                    "automaton": {
+                        "signals": 0,
+                        "trades_attempted": 0,
+                        "trades_executed": 0,
+                        "skip_reason": "no_signal"
+                    }
+                }))
 
-        # Fallback report for automaton if the strategy returned early (no signal)
-        if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
-            print(json.dumps({
-                "automaton": {
-                    "signals": 0,
-                    "trades_attempted": 0,
-                    "trades_executed": 0,
-                    "skip_reason": "no_signal"
-                }
-            }))
+        except Exception as e:
+            print(f"Loop error: {e}")
 
-    except Exception as e:
-        print(f"Loop error: {e}")
-
-    print("\n⏳ Waiting 30 seconds before next scan...\n")
-    time.sleep(30)
+        print("\n⏳ Waiting 30 seconds before next scan...\n")
+        time.sleep(30)
