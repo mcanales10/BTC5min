@@ -607,17 +607,6 @@ def calculate_position_size(max_size, smart_sizing=False):
 # Main Strategy Logic
 # =============================================================================
 
-while True:
-    run_fast_market_strategy(
-        dry_run=dry_run,
-        positions_only=args.positions,
-        show_config=args.config,
-        smart_sizing=args.smart_sizing,
-        quiet=args.quiet,
-    )
-    print("\n⏳ Waiting 30 seconds before next scan...\n")
-    time.sleep(30)
-
     log("⚡ Simmer FastLoop Trading Skill")
     log("=" * 50)
 
