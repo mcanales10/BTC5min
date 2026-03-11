@@ -442,13 +442,68 @@ def find_best_fast_market(markets):
 def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
     """Get price momentum from Coinbase API (more reliable on cloud hosts)."""
 
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
+    product_map = {
+        "BTCUSDT": "BTC-USD",
+        "ETHUSDT": "ETH-USD",
+        "SOLUSDT": "SOL-USD",
+    }
+    product = product_map.get(symbol, "BTC-USD")
+
+    url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60"
 
     result = _api_request(url)
 
     if not result or isinstance(result, dict):
         return None
 
+    try:
+        candles = result[:lookback_minutes]
+
+        if len(candles) < 2:
+            return None
+
+        # Coinbase candle format:
+        # [time, low, high, open, close, volume]
+        price_then = float(candles[-1][4])
+        price_now = float(candles[0][4])
+
+        momentum_pct = ((price_now - price_then) / price_then) * 100
+        direction = "up" if momentum_pct > 0 else "down"
+
+        volumes = [float(c[5]) for c in candles]
+        avg_volume = sum(volumes) / len(volumes)
+        latest_volume = volumes[0]
+        volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+
+        return {
+            "momentum_pct": momentum_pct,
+            "direction": direction,
+            "price_now": price_now,
+            "price_then": price_then,
+            "avg_volume": avg_volume,
+            "latest_volume": latest_volume,
+            "volume_ratio": volume_ratio,
+            "candles": len(candles),
+        }
+
+    except Exception:
+        return None
+
+
+COINGECKO_ASSETS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+
+
+def get_momentum(asset="BTC", source="binance", lookback=5):
+    """Get price momentum from configured source."""
+    if source == "binance":
+        symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
+        return get_binance_momentum(symbol, lookback)
+    elif source == "coingecko":
+        print("  ⚠️  CoinGecko free tier doesn't provide candle data — switch to binance")
+        print("  Run: python fastloop_trader.py --set signal_source=binance")
+        return None
+    else:
+        return None
 
 # =============================================================================
 # Import & Trade
