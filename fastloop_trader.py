@@ -962,13 +962,19 @@ while True:
         print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
         print(f"  Action: {'PAPER' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
 
-    # Structured report for automaton (takes priority over fallback in __main__)
+      # Structured report for automaton (takes priority over fallback in __main__)
     if os.environ.get("AUTOMATON_MANAGED"):
-        global _automaton_reported
         amount = round(position_size, 2) if total_trades > 0 else 0
-        report = {"signals": 1, "trades_attempted": 1, "trades_executed": total_trades, "amount_usd": amount}
+        report = {
+            "signals": 1,
+            "trades_attempted": 1,
+            "trades_executed": total_trades,
+            "amount_usd": amount
+        }
+
         if execution_error:
             report["execution_errors"] = [execution_error]
+
         print(json.dumps({"automaton": report}))
         _automaton_reported = True
 
