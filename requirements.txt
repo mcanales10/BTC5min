@@ -1,2 +1,2 @@
-simmer -sdk
+simmer-sdk
 requests
