@@ -1023,15 +1023,31 @@ if __name__ == "__main__":
 
     dry_run = not args.live
 
-    run_fast_market_strategy(
-        dry_run=dry_run,
-        positions_only=args.positions,
-        show_config=args.config,
-        smart_sizing=args.smart_sizing,
-        quiet=args.quiet,
-    )
+import time
 
-    # Fallback report for automaton if the strategy returned early (no signal)
-    # The function emits its own report when it reaches a trade; this covers early exits.
-    if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
-        print(json.dumps({"automaton": {"signals": 0, "trades_attempted": 0, "trades_executed": 0, "skip_reason": "no_signal"}}))
+while True:
+    try:
+        run_fast_market_strategy(
+            dry_run=dry_run,
+            positions_only=args.positions,
+            show_config=args.config,
+            smart_sizing=args.smart_sizing,
+            quiet=args.quiet,
+        )
+
+        # Fallback report for automaton if the strategy returned early (no signal)
+        if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
+            print(json.dumps({
+                "automaton": {
+                    "signals": 0,
+                    "trades_attempted": 0,
+                    "trades_executed": 0,
+                    "skip_reason": "no_signal"
+                }
+            }))
+
+    except Exception as e:
+        print(f"Loop error: {e}")
+
+    print("\n⏳ Waiting 30 seconds before next scan...\n")
+    time.sleep(30)
