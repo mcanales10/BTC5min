@@ -449,33 +449,6 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
     if not result or isinstance(result, dict):
         return None
 
-    try:
-        candles = result[:lookback_minutes]
-
-        price_then = float(candles[-1][4])
-        price_now = float(candles[0][4])
-
-        momentum_pct = ((price_now - price_then) / price_then) * 100
-        direction = "up" if momentum_pct > 0 else "down"
-
-        volumes = [float(c[5]) for c in candles]
-        avg_volume = sum(volumes) / len(volumes)
-        latest_volume = volumes[0]
-        volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
-
-        return {
-            "momentum_pct": momentum_pct,
-            "direction": direction,
-            "price_now": price_now,
-            "price_then": price_then,
-            "avg_volume": avg_volume,
-            "latest_volume": latest_volume,
-            "volume_ratio": volume_ratio,
-            "candles": len(candles),
-        }
-
-    except Exception:
-        return None
 
 # =============================================================================
 # Import & Trade
