@@ -67,6 +67,18 @@ CONFIG_SCHEMA = {
                           "help": "Weight signal by volume (higher volume = more confident)"},
     "daily_budget": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
                      "help": "Max total spend per UTC day"},
+    "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
+                        "help": "Take profit percentage for position exits"},
+    "stop_loss_pct": {"default": 0.10, "env": "SIMMER_SPRINT_SL", "type": float,
+                      "help": "Stop loss percentage for position exits"},
+    "daily_loss_limit": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_LOSS", "type": float,
+                         "help": "Stop trading after this much realized loss in a UTC day"},
+    "daily_profit_target": {"default": 50.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
+                            "help": "Stop trading after this much realized profit in a UTC day"},
+    "max_trades_per_day": {"default": 8, "env": "SIMMER_SPRINT_MAX_TRADES", "type": int,
+                           "help": "Maximum entries per UTC day"},
+    "resolution_exit_seconds": {"default": 15, "env": "SIMMER_SPRINT_RESOLVE_EXIT", "type": int,
+                                "help": "Exit paper positions this many seconds before market expiry if still open"},
 }
 
 TRADE_SOURCE = "sdk:fastloop"
@@ -74,11 +86,11 @@ SKILL_SLUG = "polymarket-fast-loop"
 _automaton_reported = False
 SMART_SIZING_PCT = 0.05  # 5% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
-MAX_SPREAD_PCT = 0.12     # Skip if CLOB bid-ask spread exceeds this
+MAX_SPREAD_PCT = 0.06     # Skip if CLOB bid-ask spread exceeds this
 MIN_ENTRY_PRICE = 0.05
 MAX_ENTRY_PRICE = 0.49
-SKIP_MIDDLE_LOW = 0.42
-SKIP_MIDDLE_HIGH = 0.58
+SKIP_MIDDLE_LOW = 0.35
+SKIP_MIDDLE_HIGH = 0.65
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
 
@@ -121,6 +133,12 @@ else:
     MIN_TIME_REMAINING = max(30, _window_seconds.get(WINDOW, 300) // 10)
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
 DAILY_BUDGET = cfg["daily_budget"]
+TAKE_PROFIT_PCT = cfg["take_profit_pct"]
+STOP_LOSS_PCT = cfg["stop_loss_pct"]
+DAILY_LOSS_LIMIT = cfg["daily_loss_limit"]
+DAILY_PROFIT_TARGET = cfg["daily_profit_target"]
+MAX_TRADES_PER_DAY = cfg["max_trades_per_day"]
+RESOLUTION_EXIT_SECONDS = cfg["resolution_exit_seconds"]
 
 # Polymarket crypto fee formula constants (from docs.polymarket.com/trading/fees)
 # fee = C × p × POLY_FEE_RATE × (p × (1-p))^POLY_FEE_EXPONENT
@@ -215,6 +233,140 @@ def _tick_market_cooldowns(skill_file):
     _save_bad_markets(skill_file, updated)
     return updated
 
+
+
+# =============================================================================
+# Paper State Tracking
+# =============================================================================
+
+def _get_paper_state_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "paper_state.json"
+
+
+def _load_paper_state(skill_file):
+    """Load today's paper state. Resets automatically at UTC date rollover."""
+    path = _get_paper_state_path(skill_file)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if path.exists():
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if data.get("date") == today and isinstance(data.get("open_positions", []), list):
+                data.setdefault("spent", 0.0)
+                data.setdefault("trades", 0)
+                data.setdefault("realized_pnl", 0.0)
+                data.setdefault("wins", 0)
+                data.setdefault("losses", 0)
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {
+        "date": today,
+        "spent": 0.0,
+        "trades": 0,
+        "realized_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "open_positions": [],
+    }
+
+
+def _save_paper_state(skill_file, state):
+    path = _get_paper_state_path(skill_file)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _paper_has_open_position(state, market_id=None, question=None):
+    for pos in state.get("open_positions", []):
+        if market_id and pos.get("market_id") == market_id:
+            return True
+        if question and pos.get("question", "").lower() == (question or "").lower():
+            return True
+    return False
+
+
+def _estimate_fee_per_share(price):
+    return price * (POLY_FEE_RATE * (price * (1 - price)) ** POLY_FEE_EXPONENT)
+
+
+def _close_paper_position(state, pos, exit_price, reason):
+    shares = float(pos.get("shares", 0.0))
+    entry_price = float(pos.get("entry_price", 0.0))
+    entry_fee_per_share = float(pos.get("entry_fee_per_share", _estimate_fee_per_share(entry_price)))
+    exit_fee_per_share = float(_estimate_fee_per_share(exit_price))
+    gross = shares * (exit_price - entry_price)
+    fees = shares * (entry_fee_per_share + exit_fee_per_share)
+    realized = gross - fees
+    state["realized_pnl"] = round(float(state.get("realized_pnl", 0.0)) + realized, 6)
+    if realized >= 0:
+        state["wins"] = int(state.get("wins", 0)) + 1
+    else:
+        state["losses"] = int(state.get("losses", 0)) + 1
+    pos["exit_price"] = exit_price
+    pos["exit_reason"] = reason
+    pos["realized_pnl"] = round(realized, 6)
+    return realized, fees
+
+
+def manage_paper_positions(skill_file, log):
+    """Check open paper positions for TP/SL/time exits and update paper ledger."""
+    state = _load_paper_state(skill_file)
+    open_positions = list(state.get("open_positions", []))
+    if not open_positions:
+        return state, []
+
+    remaining_positions = []
+    closed = []
+
+    for pos in open_positions:
+        clob_tokens = pos.get("clob_token_ids") or []
+        yes_price = fetch_live_prices(clob_tokens) if clob_tokens else None
+        if yes_price is None:
+            remaining_positions.append(pos)
+            continue
+
+        current_price = yes_price if pos.get("side") == "yes" else (1 - yes_price)
+        target_price = float(pos.get("target_price", 0.0))
+        stop_price = float(pos.get("stop_price", 0.0))
+        end_time = _parse_resolves_at(pos.get("end_time")) if isinstance(pos.get("end_time"), str) else pos.get("end_time")
+        seconds_left = None
+        if end_time:
+            seconds_left = (end_time - datetime.now(timezone.utc)).total_seconds()
+
+        reason = None
+        if current_price >= target_price > 0:
+            reason = "take_profit"
+        elif current_price <= stop_price < 1:
+            reason = "stop_loss"
+        elif seconds_left is not None and seconds_left <= RESOLUTION_EXIT_SECONDS:
+            reason = "time_exit"
+
+        if reason:
+            realized, fees = _close_paper_position(state, pos, current_price, reason)
+            closed.append({
+                "question": pos.get("question", "Unknown"),
+                "side": pos.get("side"),
+                "shares": pos.get("shares", 0.0),
+                "entry_price": pos.get("entry_price", 0.0),
+                "exit_price": round(current_price, 6),
+                "reason": reason,
+                "realized_pnl": round(realized, 6),
+                "fees": round(fees, 6),
+            })
+            log(
+                f"  ✅ [PAPER] Sold {float(pos.get('shares', 0.0)):.1f} {str(pos.get('side', '')).upper()} shares @ ${current_price:.3f} "
+                f"({reason}, P&L ${realized:.2f})",
+                force=True,
+            )
+        else:
+            pos["last_price"] = round(current_price, 6)
+            remaining_positions.append(pos)
+
+    state["open_positions"] = remaining_positions
+    _save_paper_state(skill_file, state)
+    return state, closed
 
 # =============================================================================
 # API Helpers
@@ -698,8 +850,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
     log(f"  Entry prices:     {MIN_ENTRY_PRICE:.2f} to {MAX_ENTRY_PRICE:.2f}, skip middle {SKIP_MIDDLE_LOW:.2f}-{SKIP_MIDDLE_HIGH:.2f}")
-    daily_spend = _load_daily_spend(__file__)
-    log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
+    log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%}")
+    log(f"  Daily stops:      -${DAILY_LOSS_LIMIT:.2f} / +${DAILY_PROFIT_TARGET:.2f}")
+    live_spend = _load_daily_spend(__file__)
+    paper_state = _load_paper_state(__file__)
+    budget_state = paper_state if dry_run else live_spend
+    log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${budget_state['spent']:.2f} spent today, {budget_state['trades']} trades)")
+    log(f"  Current fast-market P&L: ${paper_state['realized_pnl']:.2f} across {len(paper_state.get('open_positions', []))} open positions")
 
     if show_config:
         config_path = get_config_path(__file__)
@@ -712,6 +869,19 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Initialize client early to validate API key (paper mode when not live)
     get_client(live=not dry_run)
+
+    # Manage paper exits before looking for fresh entries
+    paper_state, closed_paper_positions = manage_paper_positions(__file__, log)
+
+    if paper_state["realized_pnl"] <= -abs(DAILY_LOSS_LIMIT):
+        log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). No more entries today.", force=True)
+        return
+    if paper_state["realized_pnl"] >= DAILY_PROFIT_TARGET:
+        log(f"\n🎯 Daily paper profit target reached (${paper_state['realized_pnl']:.2f}). No more entries today.", force=True)
+        return
+    if paper_state["trades"] >= MAX_TRADES_PER_DAY:
+        log(f"\n📉 Daily paper trade cap reached ({paper_state['trades']}/{MAX_TRADES_PER_DAY}). No more entries today.", force=True)
+        return
 
     # Show positions if requested
     if positions_only:
@@ -777,10 +947,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"\n🎯 Selected: {best['question']}")
     log(f"  Expires in: {remaining:.0f}s")
 
-    # Dedup: skip if we already hold a position on this market
+    # Dedup: skip if we already hold a live or paper position on this market
     _mid = best.get("market_id") or ""
     _q = best.get("question", "").lower()
-    existing = get_positions()
+    skip_reasons = []
+    existing = [] if dry_run else get_positions()
     for pos in existing:
         held = (pos.get("shares_yes") or 0) + (pos.get("shares_no") or 0)
         if held <= 0:
@@ -790,8 +961,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             if not quiet:
                 print(f"📊 Summary: No trade (already holding this market)")
             skip_reasons.append("already holding")
-            _emit_skip_report()
             return
+
+    if _paper_has_open_position(paper_state, market_id=_mid, question=best.get("question", "")):
+        log(f"  ⏸️  Already holding PAPER position on this market — skip (dedup)")
+        if not quiet:
+            print(f"📊 Summary: No trade (already holding this market)")
+        skip_reasons.append("already holding paper position")
+        return
 
     # Fetch live CLOB price — required for fast markets (stale prices cause bad trades)
     clob_tokens = best.get("clob_token_ids", [])
@@ -836,7 +1013,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     momentum_pct = abs(momentum["momentum_pct"])
     direction = momentum["direction"]
-    skip_reasons = []
 
     def _emit_skip_report(signals=1, attempted=0):
         """Emit automaton JSON with skip_reason before early return."""
@@ -876,6 +1052,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 skip_reasons.append("wide spread")
                 _emit_skip_report()
                 return
+        else:
+            log("  ⏸️  Could not fetch usable order book — skip")
+            _set_market_cooldown(__file__, best)
+            if not quiet:
+                print("📊 Summary: No trade (order book unavailable)")
+            skip_reasons.append("order book unavailable")
+            _emit_skip_report()
+            return
 
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
@@ -949,9 +1133,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         return
 
     # Daily budget check
-    remaining_budget = DAILY_BUDGET - daily_spend["spent"]
+    working_budget = paper_state if dry_run else live_spend
+    remaining_budget = DAILY_BUDGET - working_budget["spent"]
+    if working_budget["trades"] >= MAX_TRADES_PER_DAY:
+        log(f"  ⏸️  Max trades per day reached ({working_budget['trades']}/{MAX_TRADES_PER_DAY}) — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (daily trade cap reached)")
+        skip_reasons.append("daily trade cap")
+        _emit_skip_report()
+        return
     if remaining_budget <= 0:
-        log(f"  ⏸️  Daily budget exhausted (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent) — skip")
+        log(f"  ⏸️  Daily budget exhausted (${working_budget['spent']:.2f}/${DAILY_BUDGET:.2f} spent) — skip")
         if not quiet:
             print(f"📊 Summary: No trade (daily budget exhausted)")
         skip_reasons.append("daily budget exhausted")
@@ -959,7 +1151,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         return
     if position_size > remaining_budget:
         position_size = remaining_budget
-        log(f"  Budget cap: trade capped at ${position_size:.2f} (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent)")
+        log(f"  Budget cap: trade capped at ${position_size:.2f} (${working_budget['spent']:.2f}/${DAILY_BUDGET:.2f} spent)")
     if position_size < 0.50:
         log(f"  ⏸️  Remaining budget ${position_size:.2f} < $0.50 — skip")
         if not quiet:
@@ -998,15 +1190,35 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     result = execute_trade(market_id, side, position_size)
 
     if result and result.get("success"):
-        shares = result.get("shares_bought") or result.get("shares") or 0
+        shares = float(result.get("shares_bought") or result.get("shares") or 0)
         trade_id = result.get("trade_id")
         log(f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
 
-        # Update daily spend (skip for paper trades)
-        if not result.get("simulated"):
-            daily_spend["spent"] += position_size
-            daily_spend["trades"] += 1
-            _save_daily_spend(__file__, daily_spend)
+        if result.get("simulated"):
+            target_price = round(price * (1 + TAKE_PROFIT_PCT), 6)
+            stop_price = round(max(0.001, price * (1 - STOP_LOSS_PCT)), 6)
+            paper_state["spent"] = round(float(paper_state.get("spent", 0.0)) + position_size, 6)
+            paper_state["trades"] = int(paper_state.get("trades", 0)) + 1
+            paper_state.setdefault("open_positions", []).append({
+                "market_id": market_id,
+                "question": best.get("question", ""),
+                "side": side,
+                "shares": round(shares, 6),
+                "entry_price": round(price, 6),
+                "entry_cost": round(position_size, 6),
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "end_time": end_time.isoformat() if end_time else None,
+                "clob_token_ids": clob_tokens,
+                "target_price": target_price,
+                "stop_price": stop_price,
+                "entry_fee_per_share": round(_estimate_fee_per_share(price), 8),
+            })
+            _save_paper_state(__file__, paper_state)
+            log(f"  📒 [PAPER] Tracking position with TP ${target_price:.3f} / SL ${stop_price:.3f}", force=True)
+        else:
+            live_spend["spent"] += position_size
+            live_spend["trades"] += 1
+            _save_daily_spend(__file__, live_spend)
 
         # Log to trade journal (skip for paper trades)
         if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
@@ -1091,6 +1303,7 @@ if __name__ == "__main__":
 
     while True:
         try:
+            _tick_market_cooldowns(__file__)
             run_fast_market_strategy(
                 dry_run=dry_run,
                 positions_only=args.positions,
