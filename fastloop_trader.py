@@ -51,7 +51,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "max_position": {"default": 5.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+    "max_position": {"default": 10.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance)"},
@@ -65,7 +65,7 @@ CONFIG_SCHEMA = {
                "help": "Market window duration (5m or 15m)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
-    "daily_budget": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
+    "daily_budget": {"default": 40.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
                      "help": "Max total spend per UTC day"},
     "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
                         "help": "Take profit percentage for position exits"},
@@ -73,7 +73,7 @@ CONFIG_SCHEMA = {
                       "help": "Stop loss percentage for position exits"},
     "daily_loss_limit": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_LOSS", "type": float,
                          "help": "Stop trading after this much realized loss in a UTC day"},
-    "daily_profit_target": {"default": 50.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
+    "daily_profit_target": {"default": 60.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
                             "help": "Stop trading after this much realized profit in a UTC day"},
     "max_trades_per_day": {"default": 8, "env": "SIMMER_SPRINT_MAX_TRADES", "type": int,
                            "help": "Maximum entries per UTC day"},
@@ -88,9 +88,12 @@ SMART_SIZING_PCT = 0.05  # 5% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
 MAX_SPREAD_PCT = 0.06     # Skip if CLOB bid-ask spread exceeds this
 MIN_ENTRY_PRICE = 0.05
-MAX_ENTRY_PRICE = 0.49
+MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
+MOMENTUM_MAX_ENTRY = 0.35
+CONTRARIAN_LOW = 0.15
+CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
 
@@ -849,7 +852,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry prices:     {MIN_ENTRY_PRICE:.2f} to {MAX_ENTRY_PRICE:.2f}, skip middle {SKIP_MIDDLE_LOW:.2f}-{SKIP_MIDDLE_HIGH:.2f}")
+    log(f"  Entry rules:      momentum only below 0.35 | contrarian below 0.15 or above 0.85")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%}")
     log(f"  Daily stops:      -${DAILY_LOSS_LIMIT:.2f} / +${DAILY_PROFIT_TARGET:.2f}")
     live_spend = _load_daily_spend(__file__)
@@ -1125,12 +1128,25 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
 
-    # Entry price filter
-    if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE or (SKIP_MIDDLE_LOW < price < SKIP_MIDDLE_HIGH):
-        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range")
+    # Entry price / strategy-mode filter
+    strategy_mode = None
+    if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
+        log(f"  ⏸️  Entry price ${price:.3f} outside global allowed range")
         skip_reasons.append("price filter")
         _emit_skip_report()
         return
+
+    if price < CONTRARIAN_LOW or price > CONTRARIAN_HIGH:
+        strategy_mode = "contrarian_extreme"
+    elif price < MOMENTUM_MAX_ENTRY:
+        strategy_mode = "momentum"
+    else:
+        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for both momentum and contrarian modes")
+        skip_reasons.append("price filter")
+        _emit_skip_report()
+        return
+
+    log(f"  Strategy mode:   {strategy_mode}")
 
     # Daily budget check
     working_budget = paper_state if dry_run else live_spend
