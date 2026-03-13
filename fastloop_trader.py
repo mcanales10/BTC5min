@@ -237,6 +237,69 @@ def _tick_market_cooldowns(skill_file):
     return updated
 
 
+def _get_stoploss_cooldown_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "stoploss_cooldowns.json"
+
+
+def _load_stoploss_cooldowns(skill_file):
+    path = _get_stoploss_cooldown_path(skill_file)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if path.exists():
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("date") == today and isinstance(data.get("markets", {}), dict):
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"date": today, "markets": {}}
+
+
+def _save_stoploss_cooldowns(skill_file, data):
+    path = _get_stoploss_cooldown_path(skill_file)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def _set_stoploss_cooldown(skill_file, market_key, market_question="", expires_at=None):
+    data = _load_stoploss_cooldowns(skill_file)
+    if not market_key and not market_question:
+        return
+    key = str(market_key or market_question)
+    data["markets"][key] = {
+        "question": market_question or key,
+        "expires_at": expires_at if isinstance(expires_at, str) else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_stoploss_cooldowns(skill_file, data)
+
+
+def _stoploss_cooldown_active(skill_file, market_key=None, market_question=None):
+    data = _load_stoploss_cooldowns(skill_file)
+    markets = data.get("markets", {})
+    candidates = []
+    if market_key:
+        candidates.append(str(market_key))
+    if market_question:
+        candidates.append(str(market_question))
+    now = datetime.now(timezone.utc)
+    dirty = False
+    for key in list(markets.keys()):
+        exp = markets.get(key, {}).get("expires_at")
+        if exp:
+            dt = _parse_resolves_at(exp) if isinstance(exp, str) else None
+            if dt and dt <= now:
+                markets.pop(key, None)
+                dirty = True
+    if dirty:
+        _save_stoploss_cooldowns(skill_file, data)
+    for key in candidates:
+        if key in markets:
+            return True, markets[key]
+    return False, None
+
+
 
 # =============================================================================
 # Paper State Tracking
@@ -310,7 +373,7 @@ def _close_paper_position(state, pos, exit_price, reason):
     pos["exit_price"] = exit_price
     pos["exit_reason"] = reason
     pos["realized_pnl"] = round(realized, 6)
-    return realized, fees
+    return realized, fees, pos
 
 
 def manage_paper_positions(skill_file, log):
@@ -347,7 +410,15 @@ def manage_paper_positions(skill_file, log):
             reason = "time_exit"
 
         if reason:
-            realized, fees = _close_paper_position(state, pos, current_price, reason)
+            realized, fees, closed_pos = _close_paper_position(state, pos, current_price, reason)
+            if reason == "stop_loss":
+                _set_stoploss_cooldown(
+                    skill_file,
+                    closed_pos.get("market_id"),
+                    closed_pos.get("question", ""),
+                    closed_pos.get("end_time"),
+                )
+                log(f"  🧊 [PAPER] Stop-loss cooldown set for this market until expiry", force=True)
             closed.append({
                 "question": pos.get("question", "Unknown"),
                 "side": pos.get("side"),
@@ -971,6 +1042,16 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if not quiet:
             print(f"📊 Summary: No trade (already holding this market)")
         skip_reasons.append("already holding paper position")
+        return
+
+    cooldown_active, cooldown_meta = _stoploss_cooldown_active(__file__, market_key=_mid, market_question=best.get("question", ""))
+    if cooldown_active:
+        log(f"  ⏸️  Stop-loss cooldown active for this market — skip re-entry")
+        if cooldown_meta and cooldown_meta.get("expires_at"):
+            log(f"     Cooldown until: {cooldown_meta.get('expires_at')}")
+        if not quiet:
+            print(f"📊 Summary: No trade (stop-loss cooldown)")
+        skip_reasons.append("stop-loss cooldown")
         return
 
     # Fetch live CLOB price — required for fast markets (stale prices cause bad trades)
