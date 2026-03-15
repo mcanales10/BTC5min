@@ -51,7 +51,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "max_position": {"default": 10.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+    "max_position": {"default": 20.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance)"},
@@ -65,18 +65,22 @@ CONFIG_SCHEMA = {
                "help": "Market window duration (5m or 15m)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
-    "daily_budget": {"default": 40.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
-                     "help": "Max total spend per UTC day"},
+    "daily_budget": {"default": 0.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
+                     "help": "Legacy budget cap (unused)"},
+    "max_open_exposure": {"default": 20.0, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
+                            "help": "Maximum simultaneous open exposure across active positions"},
     "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
                         "help": "Take profit percentage for position exits"},
     "stop_loss_pct": {"default": 0.10, "env": "SIMMER_SPRINT_SL", "type": float,
                       "help": "Stop loss percentage for position exits"},
     "daily_loss_limit": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_LOSS", "type": float,
                          "help": "Stop trading after this much realized loss in a UTC day"},
-    "daily_profit_target": {"default": 60.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
-                            "help": "Stop trading after this much realized profit in a UTC day"},
-    "max_trades_per_day": {"default": 8, "env": "SIMMER_SPRINT_MAX_TRADES", "type": int,
-                           "help": "Maximum entries per UTC day"},
+    "daily_profit_target": {"default": 0.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
+                            "help": "Legacy profit target (unused)"},
+    "max_trades_per_day": {"default": 0, "env": "SIMMER_SPRINT_MAX_TRADES", "type": int,
+                           "help": "Legacy trade cap (unused)"},
+    "pause_hours_after_loss": {"default": 24, "env": "SIMMER_SPRINT_PAUSE_HOURS", "type": int,
+                           "help": "Pause new entries for this many hours after loss stop is hit"},
     "resolution_exit_seconds": {"default": 15, "env": "SIMMER_SPRINT_RESOLVE_EXIT", "type": int,
                                 "help": "Exit paper positions this many seconds before market expiry if still open"},
 }
@@ -136,11 +140,13 @@ else:
     MIN_TIME_REMAINING = max(30, _window_seconds.get(WINDOW, 300) // 10)
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
 DAILY_BUDGET = cfg["daily_budget"]
+MAX_OPEN_EXPOSURE = cfg["max_open_exposure"]
 TAKE_PROFIT_PCT = cfg["take_profit_pct"]
 STOP_LOSS_PCT = cfg["stop_loss_pct"]
 DAILY_LOSS_LIMIT = cfg["daily_loss_limit"]
 DAILY_PROFIT_TARGET = cfg["daily_profit_target"]
 MAX_TRADES_PER_DAY = cfg["max_trades_per_day"]
+PAUSE_HOURS_AFTER_LOSS = cfg["pause_hours_after_loss"]
 RESOLUTION_EXIT_SECONDS = cfg["resolution_exit_seconds"]
 
 # Polymarket crypto fee formula constants (from docs.polymarket.com/trading/fees)
@@ -237,69 +243,6 @@ def _tick_market_cooldowns(skill_file):
     return updated
 
 
-def _get_stoploss_cooldown_path(skill_file):
-    from pathlib import Path
-    return Path(skill_file).parent / "stoploss_cooldowns.json"
-
-
-def _load_stoploss_cooldowns(skill_file):
-    path = _get_stoploss_cooldown_path(skill_file)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if path.exists():
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data.get("date") == today and isinstance(data.get("markets", {}), dict):
-                return data
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {"date": today, "markets": {}}
-
-
-def _save_stoploss_cooldowns(skill_file, data):
-    path = _get_stoploss_cooldown_path(skill_file)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-
-
-def _set_stoploss_cooldown(skill_file, market_key, market_question="", expires_at=None):
-    data = _load_stoploss_cooldowns(skill_file)
-    if not market_key and not market_question:
-        return
-    key = str(market_key or market_question)
-    data["markets"][key] = {
-        "question": market_question or key,
-        "expires_at": expires_at if isinstance(expires_at, str) else None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _save_stoploss_cooldowns(skill_file, data)
-
-
-def _stoploss_cooldown_active(skill_file, market_key=None, market_question=None):
-    data = _load_stoploss_cooldowns(skill_file)
-    markets = data.get("markets", {})
-    candidates = []
-    if market_key:
-        candidates.append(str(market_key))
-    if market_question:
-        candidates.append(str(market_question))
-    now = datetime.now(timezone.utc)
-    dirty = False
-    for key in list(markets.keys()):
-        exp = markets.get(key, {}).get("expires_at")
-        if exp:
-            dt = _parse_resolves_at(exp) if isinstance(exp, str) else None
-            if dt and dt <= now:
-                markets.pop(key, None)
-                dirty = True
-    if dirty:
-        _save_stoploss_cooldowns(skill_file, data)
-    for key in candidates:
-        if key in markets:
-            return True, markets[key]
-    return False, None
-
-
 
 # =============================================================================
 # Paper State Tracking
@@ -343,6 +286,102 @@ def _save_paper_state(skill_file, state):
     with open(path, "w") as f:
         json.dump(state, f, indent=2)
 
+def _get_guard_state_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "guard_state.json"
+
+
+def _load_guard_state(skill_file):
+    path = _get_guard_state_path(skill_file)
+    if path.exists():
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("pause_until", None)
+                data.setdefault("reason", "")
+                data.setdefault("trigger_pnl", 0.0)
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"pause_until": None, "reason": "", "trigger_pnl": 0.0}
+
+
+def _save_guard_state(skill_file, state):
+    path = _get_guard_state_path(skill_file)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _guard_pause_remaining(skill_file):
+    state = _load_guard_state(skill_file)
+    until = _parse_iso_dt(state.get("pause_until"))
+    if until is None:
+        return state, 0
+    now = datetime.now(timezone.utc)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    remaining = int((until - now).total_seconds())
+    if remaining <= 0:
+        state["pause_until"] = None
+        state["reason"] = ""
+        state["trigger_pnl"] = 0.0
+        _save_guard_state(skill_file, state)
+        return state, 0
+    return state, remaining
+
+
+def _activate_loss_pause(skill_file, realized_pnl, reason="daily_loss_stop"):
+    state = _load_guard_state(skill_file)
+    until = datetime.now(timezone.utc) + timedelta(hours=int(PAUSE_HOURS_AFTER_LOSS))
+    state["pause_until"] = until.isoformat()
+    state["reason"] = reason
+    state["trigger_pnl"] = round(float(realized_pnl), 6)
+    _save_guard_state(skill_file, state)
+    return state
+
+
+def _current_paper_open_exposure(state):
+    return round(sum(float(p.get("entry_cost", 0.0)) for p in state.get("open_positions", [])), 6)
+
+
+def _estimate_live_open_exposure(positions):
+    exposure = 0.0
+    count = 0
+    for pos in positions or []:
+        held = float(pos.get("shares_yes", 0) or 0) + float(pos.get("shares_no", 0) or 0)
+        if held <= 0:
+            continue
+        if "up or down" not in (pos.get("question", "") or "").lower():
+            continue
+        count += 1
+        exposure += float(pos.get("entry_cost", 0.0) or pos.get("cost_basis", 0.0) or pos.get("notional_usdc", 0.0) or MAX_POSITION_USD)
+    return round(exposure, 6), count
+
+
+def _extract_live_realized_pnl():
+    portfolio = get_portfolio()
+    if not portfolio or portfolio.get("error"):
+        return None
+    for key in ("realized_pnl_usdc", "realized_pnl", "realizedPnl", "pnl_realized", "pnl"):
+        val = portfolio.get(key)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 def _paper_has_open_position(state, market_id=None, question=None):
     for pos in state.get("open_positions", []):
@@ -373,7 +412,7 @@ def _close_paper_position(state, pos, exit_price, reason):
     pos["exit_price"] = exit_price
     pos["exit_reason"] = reason
     pos["realized_pnl"] = round(realized, 6)
-    return realized, fees, pos
+    return realized, fees
 
 
 def manage_paper_positions(skill_file, log):
@@ -410,15 +449,7 @@ def manage_paper_positions(skill_file, log):
             reason = "time_exit"
 
         if reason:
-            realized, fees, closed_pos = _close_paper_position(state, pos, current_price, reason)
-            if reason == "stop_loss":
-                _set_stoploss_cooldown(
-                    skill_file,
-                    closed_pos.get("market_id"),
-                    closed_pos.get("question", ""),
-                    closed_pos.get("end_time"),
-                )
-                log(f"  🧊 [PAPER] Stop-loss cooldown set for this market until expiry", force=True)
+            realized, fees = _close_paper_position(state, pos, current_price, reason)
             closed.append({
                 "question": pos.get("question", "Unknown"),
                 "side": pos.get("side"),
@@ -925,12 +956,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
     log(f"  Entry rules:      momentum only below 0.35 | contrarian below 0.15 or above 0.85")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%}")
-    log(f"  Daily stops:      -${DAILY_LOSS_LIMIT:.2f} / +${DAILY_PROFIT_TARGET:.2f}")
+    log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
-    budget_state = paper_state if dry_run else live_spend
-    log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${budget_state['spent']:.2f} spent today, {budget_state['trades']} trades)")
-    log(f"  Current fast-market P&L: ${paper_state['realized_pnl']:.2f} across {len(paper_state.get('open_positions', []))} open positions")
+    paper_open_exposure = _current_paper_open_exposure(paper_state)
+    log(f"  Exposure cap:     ${MAX_OPEN_EXPOSURE:.2f} total open exposure")
+    log(f"  Loss stop:        -${DAILY_LOSS_LIMIT:.2f} then pause {PAUSE_HOURS_AFTER_LOSS}h")
+    log(f"  Paper ledger:     ${paper_state['spent']:.2f} cumulative, {paper_state['trades']} trades")
+    log(f"  Current fast-market P&L: ${paper_state['realized_pnl']:.2f} across {len(paper_state.get('open_positions', []))} open positions (open exposure ${paper_open_exposure:.2f})")
 
     if show_config:
         config_path = get_config_path(__file__)
@@ -947,15 +980,22 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Manage paper exits before looking for fresh entries
     paper_state, closed_paper_positions = manage_paper_positions(__file__, log)
 
-    if paper_state["realized_pnl"] <= -abs(DAILY_LOSS_LIMIT):
-        log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). No more entries today.", force=True)
+    guard_state, pause_remaining = _guard_pause_remaining(__file__)
+    if pause_remaining > 0:
+        log(f"\n⏸️  Loss-stop pause active for another {pause_remaining}s (reason: {guard_state.get('reason','loss_stop')}).", force=True)
         return
-    if paper_state["realized_pnl"] >= DAILY_PROFIT_TARGET:
-        log(f"\n🎯 Daily paper profit target reached (${paper_state['realized_pnl']:.2f}). No more entries today.", force=True)
-        return
-    if paper_state["trades"] >= MAX_TRADES_PER_DAY:
-        log(f"\n📉 Daily paper trade cap reached ({paper_state['trades']}/{MAX_TRADES_PER_DAY}). No more entries today.", force=True)
-        return
+
+    if dry_run:
+        if paper_state["realized_pnl"] <= -abs(DAILY_LOSS_LIMIT):
+            _activate_loss_pause(__file__, paper_state["realized_pnl"], reason="paper_daily_loss_stop")
+            log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            return
+    else:
+        live_realized_pnl = _extract_live_realized_pnl()
+        if live_realized_pnl is not None and live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
+            _activate_loss_pause(__file__, live_realized_pnl, reason="live_daily_loss_stop")
+            log(f"\n🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            return
 
     # Show positions if requested
     if positions_only:
@@ -1042,16 +1082,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if not quiet:
             print(f"📊 Summary: No trade (already holding this market)")
         skip_reasons.append("already holding paper position")
-        return
-
-    cooldown_active, cooldown_meta = _stoploss_cooldown_active(__file__, market_key=_mid, market_question=best.get("question", ""))
-    if cooldown_active:
-        log(f"  ⏸️  Stop-loss cooldown active for this market — skip re-entry")
-        if cooldown_meta and cooldown_meta.get("expires_at"):
-            log(f"     Cooldown until: {cooldown_meta.get('expires_at')}")
-        if not quiet:
-            print(f"📊 Summary: No trade (stop-loss cooldown)")
-        skip_reasons.append("stop-loss cooldown")
         return
 
     # Fetch live CLOB price — required for fast markets (stale prices cause bad trades)
@@ -1229,31 +1259,28 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     log(f"  Strategy mode:   {strategy_mode}")
 
-    # Daily budget check
-    working_budget = paper_state if dry_run else live_spend
-    remaining_budget = DAILY_BUDGET - working_budget["spent"]
-    if working_budget["trades"] >= MAX_TRADES_PER_DAY:
-        log(f"  ⏸️  Max trades per day reached ({working_budget['trades']}/{MAX_TRADES_PER_DAY}) — skip")
+    # Open exposure check (capital recycles after exits; no cumulative daily budget cap)
+    if dry_run:
+        current_open_exposure = _current_paper_open_exposure(paper_state)
+    else:
+        current_open_exposure, _ = _estimate_live_open_exposure(existing)
+
+    remaining_exposure = MAX_OPEN_EXPOSURE - current_open_exposure
+    if remaining_exposure <= 0:
+        log(f"  ⏸️  Open exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) — skip")
         if not quiet:
-            print(f"📊 Summary: No trade (daily trade cap reached)")
-        skip_reasons.append("daily trade cap")
+            print(f"📊 Summary: No trade (open exposure cap reached)")
+        skip_reasons.append("open exposure cap")
         _emit_skip_report()
         return
-    if remaining_budget <= 0:
-        log(f"  ⏸️  Daily budget exhausted (${working_budget['spent']:.2f}/${DAILY_BUDGET:.2f} spent) — skip")
-        if not quiet:
-            print(f"📊 Summary: No trade (daily budget exhausted)")
-        skip_reasons.append("daily budget exhausted")
-        _emit_skip_report()
-        return
-    if position_size > remaining_budget:
-        position_size = remaining_budget
-        log(f"  Budget cap: trade capped at ${position_size:.2f} (${working_budget['spent']:.2f}/${DAILY_BUDGET:.2f} spent)")
+    if position_size > remaining_exposure:
+        position_size = remaining_exposure
+        log(f"  Exposure cap: trade capped at ${position_size:.2f} (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f} currently open)")
     if position_size < 0.50:
-        log(f"  ⏸️  Remaining budget ${position_size:.2f} < $0.50 — skip")
+        log(f"  ⏸️  Remaining exposure room ${position_size:.2f} < $0.50 — skip")
         if not quiet:
-            print(f"📊 Summary: No trade (remaining budget too small)")
-        skip_reasons.append("budget too small")
+            print(f"📊 Summary: No trade (exposure room too small)")
+        skip_reasons.append("exposure room too small")
         _emit_skip_report()
         return
 
