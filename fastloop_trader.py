@@ -1402,7 +1402,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         spread_pct = (pre_spread / 100.0) / mid_estimate
         log(f"  Spread: {pre_spread:.1f}¢ ({best.get('liquidity_tier', 'unknown')})")
         if spread_pct > MAX_SPREAD_PCT:
-            log(f"  ⏸️  Spread {spread_pct:.1%} > 10% — illiquid, skip")
+            log(f"  ⏸️  Spread {spread_pct:.1%} > max {MAX_SPREAD_PCT:.1%} — illiquid, skip")
             if not quiet:
                 print(f"📊 Summary: No trade (wide spread: {spread_pct:.1%})")
             skip_reasons.append("wide spread")
