@@ -455,6 +455,24 @@ def _estimate_live_open_exposure(positions):
     return round(exposure, 6), count
 
 
+def _infer_live_fill_price(position_size, shares, quoted_price):
+    """Best-effort live average fill price.
+
+    For live trades, Simmer/venue may move between quote and execution. If we know
+    the notional sent and the filled shares, derive an average fill price from
+    amount/shares instead of logging the stale pre-trade quote.
+    """
+    try:
+        shares = float(shares or 0)
+        if shares > 0 and position_size > 0:
+            inferred = float(position_size) / shares
+            if 0 < inferred < 1:
+                return inferred
+    except Exception:
+        pass
+    return float(quoted_price)
+
+
 def _extract_live_pnl_fields():
     """Read live P&L fields from Simmer portfolio response.
 
@@ -1573,7 +1591,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if result and result.get("success"):
         shares = float(result.get("shares_bought") or result.get("shares") or 0)
         trade_id = result.get("trade_id")
-        log(f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+        display_fill_price = price if result.get("simulated") else _infer_live_fill_price(position_size, shares, price)
+        log(
+            f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} {side.upper()} shares @ ${display_fill_price:.3f}"
+            + ("" if result.get("simulated") else f" (avg fill est; quote was ${price:.3f})"),
+            force=True,
+        )
 
         if result.get("simulated"):
             target_price = round(price * (1 + TAKE_PROFIT_PCT), 6)
