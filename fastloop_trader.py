@@ -464,16 +464,6 @@ def _extract_live_pnl_fields():
             if pnl_total is not None:
                 break
 
-        if pnl_24h is None or pnl_total is None:
-            try:
-                print(f"  ⚠️  Live portfolio keys: {list(portfolio.keys())}")
-                for key, value in portfolio.items():
-                    norm = _normalize(value)
-                    if isinstance(norm, dict):
-                        print(f"  ⚠️  {key} subkeys: {list(norm.keys())}")
-            except Exception:
-                pass
-
         return {
             "pnl_24h": pnl_24h,
             "pnl_total": pnl_total,
