@@ -369,24 +369,110 @@ def _estimate_live_open_exposure(positions):
 
 
 def _extract_live_pnl_fields():
-    """Read live P&L fields from Simmer portfolio response."""
+    """Read live P&L fields from Simmer portfolio response.
+
+    Simmer may return either a plain dict or an object/dataclass. This helper
+    normalizes the response and extracts the P&L fields we care about.
+    """
     try:
         portfolio = get_portfolio()
+        if not portfolio:
+            return None
+
+        def _normalize(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj
+            try:
+                from dataclasses import asdict, is_dataclass
+                if is_dataclass(obj):
+                    return asdict(obj)
+            except Exception:
+                pass
+            if hasattr(obj, "model_dump"):
+                try:
+                    dumped = obj.model_dump()
+                    if isinstance(dumped, dict):
+                        return dumped
+                except Exception:
+                    pass
+            if hasattr(obj, "_asdict"):
+                try:
+                    dumped = obj._asdict()
+                    if isinstance(dumped, dict):
+                        return dumped
+                except Exception:
+                    pass
+            if hasattr(obj, "__dict__"):
+                try:
+                    dumped = vars(obj)
+                    if isinstance(dumped, dict):
+                        return dumped
+                except Exception:
+                    pass
+            return None
+
+        portfolio = _normalize(portfolio)
         if not portfolio or portfolio.get("error"):
             return None
 
-        pnl_24h = portfolio.get("pnl_24h")
-        pnl_total = portfolio.get("pnl_total")
+        def _to_float(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
 
-        try:
-            pnl_24h = float(pnl_24h) if pnl_24h is not None else None
-        except (TypeError, ValueError):
-            pnl_24h = None
+        def _get_path(obj, *path):
+            cur = obj
+            for key in path:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(key)
+                cur = _normalize(cur) if not isinstance(cur, (str, int, float, bool, type(None))) else cur
+            return cur
 
-        try:
-            pnl_total = float(pnl_total) if pnl_total is not None else None
-        except (TypeError, ValueError):
-            pnl_total = None
+        pnl_24h = None
+        pnl_total = None
+
+        candidate_24h_paths = [
+            ("pnl_24h",),
+            ("stats", "pnl_24h"),
+            ("summary", "pnl_24h"),
+            ("portfolio", "pnl_24h"),
+            ("metrics", "pnl_24h"),
+        ]
+        candidate_total_paths = [
+            ("pnl_total",),
+            ("stats", "pnl_total"),
+            ("summary", "pnl_total"),
+            ("portfolio", "pnl_total"),
+            ("metrics", "pnl_total"),
+            ("realized_pnl",),
+            ("total_pnl",),
+        ]
+
+        for path in candidate_24h_paths:
+            pnl_24h = _to_float(_get_path(portfolio, *path))
+            if pnl_24h is not None:
+                break
+
+        for path in candidate_total_paths:
+            pnl_total = _to_float(_get_path(portfolio, *path))
+            if pnl_total is not None:
+                break
+
+        if pnl_24h is None or pnl_total is None:
+            try:
+                print(f"  ⚠️  Live portfolio keys: {list(portfolio.keys())}")
+                for key, value in portfolio.items():
+                    norm = _normalize(value)
+                    if isinstance(norm, dict):
+                        print(f"  ⚠️  {key} subkeys: {list(norm.keys())}")
+            except Exception:
+                pass
 
         return {
             "pnl_24h": pnl_24h,
