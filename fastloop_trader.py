@@ -350,6 +350,93 @@ def _activate_loss_pause(skill_file, realized_pnl, reason="daily_loss_stop"):
     return state
 
 
+def _get_live_runtime_state_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "live_runtime_state.json"
+
+
+def _load_live_runtime_state(skill_file):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = _get_live_runtime_state_path(skill_file)
+    default = {"date": today, "baseline_total_pnl": None, "market_locks": []}
+    if path.exists():
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("date") == today:
+                data.setdefault("baseline_total_pnl", None)
+                data.setdefault("market_locks", [])
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return default
+
+
+def _save_live_runtime_state(skill_file, state):
+    path = _get_live_runtime_state_path(skill_file)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _prune_live_runtime_state(skill_file, state=None):
+    state = state or _load_live_runtime_state(skill_file)
+    now = datetime.now(timezone.utc)
+    cleaned = []
+    for lock in state.get("market_locks", []):
+        until = _parse_iso_dt(lock.get("until"))
+        if until is None:
+            continue
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if until > now:
+            cleaned.append(lock)
+    state["market_locks"] = cleaned
+    _save_live_runtime_state(skill_file, state)
+    return state
+
+
+def _market_lock_key(market_id=None, question=None):
+    if market_id:
+        return str(market_id)
+    return (question or "").strip().lower()
+
+
+def _live_market_lock_active(state, market_id=None, question=None):
+    key = _market_lock_key(market_id=market_id, question=question)
+    if not key:
+        return False
+    for lock in state.get("market_locks", []):
+        if lock.get("key") == key:
+            return True
+    return False
+
+
+def _current_live_locked_exposure(state):
+    return round(sum(float(lock.get("entry_cost", 0.0) or 0.0) for lock in state.get("market_locks", [])), 6)
+
+
+def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side):
+    state = _prune_live_runtime_state(skill_file)
+    key = _market_lock_key(market_id=market_id, question=question)
+    if not key:
+        return state
+    if end_time is None:
+        end_time = datetime.now(timezone.utc) + timedelta(seconds=_window_seconds.get(WINDOW, 300))
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    state["market_locks"] = [lock for lock in state.get("market_locks", []) if lock.get("key") != key]
+    state["market_locks"].append({
+        "key": key,
+        "market_id": market_id,
+        "question": question,
+        "entry_cost": round(float(entry_cost), 6),
+        "side": side,
+        "until": end_time.isoformat(),
+    })
+    _save_live_runtime_state(skill_file, state)
+    return state
+
+
 def _current_paper_open_exposure(state):
     return round(sum(float(p.get("entry_cost", 0.0)) for p in state.get("open_positions", [])), 6)
 
@@ -473,6 +560,38 @@ def _extract_live_pnl_fields():
     except Exception as e:
         print(f"  ⚠️  Live P&L extraction error: {e}")
         return None
+
+
+def _get_live_pnl_snapshot(skill_file):
+    """Return live total P&L and an effective 24h P&L.
+
+    If Simmer does not provide pnl_24h, derive it from today's baseline pnl_total.
+    """
+    live_pnl = _extract_live_pnl_fields()
+    if not live_pnl:
+        return {"pnl_total": None, "pnl_24h_effective": None, "pnl_24h_raw": None, "portfolio": None}
+
+    state = _prune_live_runtime_state(skill_file)
+    pnl_total = live_pnl.get("pnl_total")
+    pnl_24h_raw = live_pnl.get("pnl_24h")
+    baseline = state.get("baseline_total_pnl")
+
+    if pnl_total is not None and baseline is None:
+        state["baseline_total_pnl"] = float(pnl_total)
+        baseline = state["baseline_total_pnl"]
+        _save_live_runtime_state(skill_file, state)
+
+    pnl_24h_effective = pnl_24h_raw
+    if pnl_24h_effective is None and pnl_total is not None and baseline is not None:
+        pnl_24h_effective = float(pnl_total) - float(baseline)
+
+    return {
+        "pnl_total": pnl_total,
+        "pnl_24h_raw": pnl_24h_raw,
+        "pnl_24h_effective": pnl_24h_effective,
+        "portfolio": live_pnl.get("portfolio"),
+    }
+
 
 def _paper_has_open_position(state, market_id=None, question=None):
     for pos in state.get("open_positions", []):
@@ -1050,6 +1169,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
+    live_runtime_state = _prune_live_runtime_state(__file__)
 
     if dry_run:
         budget_label = "Paper ledger"
@@ -1063,9 +1183,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         budget_spent = float(live_spend.get("spent", 0.0))
         budget_trades = int(live_spend.get("trades", 0))
         live_positions = get_positions()
-        live_pnl = _extract_live_pnl_fields()
+        live_pnl = _get_live_pnl_snapshot(__file__)
         display_pnl = None if not live_pnl else live_pnl.get("pnl_total")
-        display_open_exposure, display_open_positions = _estimate_live_open_exposure(live_positions)
+        positions_exposure, positions_count = _estimate_live_open_exposure(live_positions)
+        locked_exposure = _current_live_locked_exposure(live_runtime_state)
+        display_open_exposure = round(max(positions_exposure, locked_exposure), 6)
+        display_open_positions = max(positions_count, len(live_runtime_state.get("market_locks", [])))
 
     log(f"  Exposure cap:     ${MAX_OPEN_EXPOSURE:.2f} total open exposure")
     log(f"  Loss stop:        -${DAILY_LOSS_LIMIT:.2f} then pause {PAUSE_HOURS_AFTER_LOSS}h")
@@ -1108,8 +1231,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
     else:
-        live_pnl = _extract_live_pnl_fields()
-        live_pnl_24h = None if not live_pnl else live_pnl.get("pnl_24h")
+        live_pnl = _get_live_pnl_snapshot(__file__)
+        live_pnl_24h = None if not live_pnl else live_pnl.get("pnl_24h_effective")
 
         if live_pnl_24h is None:
             log("  ⚠️  Could not read live 24h P&L from portfolio API.", force=True)
@@ -1207,6 +1330,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if not quiet:
             print(f"📊 Summary: No trade (already holding this market)")
         skip_reasons.append("already holding paper position")
+        return
+
+    if not dry_run and _live_market_lock_active(live_runtime_state, market_id=_mid, question=best.get("question", "")):
+        log(f"  ⏸️  Live market lock active for this market — skip (dedup)")
+        if not quiet:
+            print(f"📊 Summary: No trade (market lock active)")
+        skip_reasons.append("live market lock active")
         return
 
     # Fetch live CLOB price — required for fast markets (stale prices cause bad trades)
@@ -1388,7 +1518,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if dry_run:
         current_open_exposure = _current_paper_open_exposure(paper_state)
     else:
-        current_open_exposure, _ = _estimate_live_open_exposure(existing)
+        positions_open_exposure, _ = _estimate_live_open_exposure(existing)
+        locked_open_exposure = _current_live_locked_exposure(live_runtime_state)
+        current_open_exposure = max(positions_open_exposure, locked_open_exposure)
 
     remaining_exposure = MAX_OPEN_EXPOSURE - current_open_exposure
     if remaining_exposure <= 0:
@@ -1468,6 +1600,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             live_spend["spent"] += position_size
             live_spend["trades"] += 1
             _save_daily_spend(__file__, live_spend)
+            _register_live_market_lock(
+                __file__,
+                market_id=market_id,
+                question=best.get("question", ""),
+                end_time=end_time,
+                entry_cost=position_size,
+                side=side,
+            )
 
         # Log to trade journal (skip for paper trades)
         if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
