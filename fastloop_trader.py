@@ -369,19 +369,60 @@ def _estimate_live_open_exposure(positions):
 
 
 def _extract_live_realized_pnl():
-    portfolio = get_portfolio()
-    if not portfolio or portfolio.get("error"):
-        return None
-    for key in ("realized_pnl_usdc", "realized_pnl", "realizedPnl", "pnl_realized", "pnl"):
-        val = portfolio.get(key)
-        if val is None:
-            continue
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            pass
-    return None
+    """Best-effort extraction of live realized P&L from Simmer portfolio response."""
+    try:
+        portfolio = get_portfolio()
+        if not portfolio or portfolio.get("error"):
+            return None
 
+        def get_nested(obj, path):
+            cur = obj
+            for key in path:
+                if not isinstance(cur, dict) or key not in cur:
+                    return None
+                cur = cur[key]
+            return cur
+
+        candidate_paths = [
+            ["realized_pnl_usdc"],
+            ["realized_pnl"],
+            ["realizedPnl"],
+            ["pnl_realized"],
+            ["pnl"],
+            ["total_pnl"],
+            ["totalPnl"],
+            ["stats", "realized_pnl"],
+            ["stats", "realizedPnl"],
+            ["stats", "pnl"],
+            ["stats", "realized_pnl_usdc"],
+            ["portfolio", "realized_pnl"],
+            ["portfolio", "realizedPnl"],
+            ["portfolio", "pnl"],
+            ["summary", "realized_pnl"],
+            ["summary", "realizedPnl"],
+            ["summary", "pnl"],
+        ]
+
+        for path in candidate_paths:
+            value = get_nested(portfolio, path)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+
+        try:
+            print(f"  ⚠️  Could not read live realized P&L. Portfolio keys: {list(portfolio.keys())}")
+            for key, value in portfolio.items():
+                if isinstance(value, dict):
+                    print(f"  ⚠️  {key} subkeys: {list(value.keys())}")
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        print(f"  ⚠️  Live P&L extraction error: {e}")
+        return None
 
 def _paper_has_open_position(state, market_id=None, question=None):
     for pos in state.get("open_positions", []):
@@ -959,33 +1000,32 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
-    live_realized_pnl = None
 
     if dry_run:
-        budget_state = paper_state
         budget_label = "Paper ledger"
+        budget_spent = float(paper_state.get("spent", 0.0))
+        budget_trades = int(paper_state.get("trades", 0))
         display_pnl = float(paper_state.get("realized_pnl", 0.0))
-        display_pnl_text = f"${display_pnl:.2f}"
         display_open_positions = len(paper_state.get("open_positions", []))
         display_open_exposure = _current_paper_open_exposure(paper_state)
     else:
-        budget_state = live_spend
         budget_label = "Live entries"
+        budget_spent = float(live_spend.get("spent", 0.0))
+        budget_trades = int(live_spend.get("trades", 0))
         live_positions = get_positions()
         live_realized_pnl = _extract_live_realized_pnl()
+        display_pnl = live_realized_pnl
         display_open_exposure, display_open_positions = _estimate_live_open_exposure(live_positions)
-        if live_realized_pnl is None:
-            display_pnl_text = "unavailable"
-        else:
-            display_pnl_text = f"${float(live_realized_pnl):.2f}"
 
     log(f"  Exposure cap:     ${MAX_OPEN_EXPOSURE:.2f} total open exposure")
     log(f"  Loss stop:        -${DAILY_LOSS_LIMIT:.2f} then pause {PAUSE_HOURS_AFTER_LOSS}h")
-    log(f"  {budget_label}:     ${budget_state['spent']:.2f} cumulative, {budget_state['trades']} trades")
-    log(
-        f"  Current fast-market P&L: {display_pnl_text} across "
-        f"{display_open_positions} open positions (open exposure ${display_open_exposure:.2f})"
-    )
+    log(f"  {budget_label}:     ${budget_spent:.2f} cumulative, {budget_trades} trades")
+    if display_pnl is None:
+        log(f"  Current fast-market P&L: unavailable across {display_open_positions} open positions (open exposure ${display_open_exposure:.2f})")
+        if not dry_run:
+            log("  ⚠️  Could not read live realized P&L from portfolio API.", force=True)
+    else:
+        log(f"  Current fast-market P&L: ${display_pnl:.2f} across {display_open_positions} open positions (open exposure ${display_open_exposure:.2f})")
 
     if show_config:
         config_path = get_config_path(__file__)
@@ -1013,11 +1053,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
     else:
+        live_realized_pnl = _extract_live_realized_pnl()
         if live_realized_pnl is None:
             log("  ⚠️  Could not read live realized P&L from portfolio API.", force=True)
         elif live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
             _activate_loss_pause(__file__, live_realized_pnl, reason="live_daily_loss_stop")
-            log(f"\n🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            log(f"
+🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
 
     # Show positions if requested
