@@ -1057,9 +1057,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if live_realized_pnl is None:
             log("  ⚠️  Could not read live realized P&L from portfolio API.", force=True)
         elif live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
+        elif live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
             _activate_loss_pause(__file__, live_realized_pnl, reason="live_daily_loss_stop")
-            log(f"
-🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            log(f"\n🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
 
     # Show positions if requested
