@@ -959,11 +959,33 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
-    paper_open_exposure = _current_paper_open_exposure(paper_state)
+    live_realized_pnl = None
+
+    if dry_run:
+        budget_state = paper_state
+        budget_label = "Paper ledger"
+        display_pnl = float(paper_state.get("realized_pnl", 0.0))
+        display_pnl_text = f"${display_pnl:.2f}"
+        display_open_positions = len(paper_state.get("open_positions", []))
+        display_open_exposure = _current_paper_open_exposure(paper_state)
+    else:
+        budget_state = live_spend
+        budget_label = "Live entries"
+        live_positions = get_positions()
+        live_realized_pnl = _extract_live_realized_pnl()
+        display_open_exposure, display_open_positions = _estimate_live_open_exposure(live_positions)
+        if live_realized_pnl is None:
+            display_pnl_text = "unavailable"
+        else:
+            display_pnl_text = f"${float(live_realized_pnl):.2f}"
+
     log(f"  Exposure cap:     ${MAX_OPEN_EXPOSURE:.2f} total open exposure")
     log(f"  Loss stop:        -${DAILY_LOSS_LIMIT:.2f} then pause {PAUSE_HOURS_AFTER_LOSS}h")
-    log(f"  Paper ledger:     ${paper_state['spent']:.2f} cumulative, {paper_state['trades']} trades")
-    log(f"  Current fast-market P&L: ${paper_state['realized_pnl']:.2f} across {len(paper_state.get('open_positions', []))} open positions (open exposure ${paper_open_exposure:.2f})")
+    log(f"  {budget_label}:     ${budget_state['spent']:.2f} cumulative, {budget_state['trades']} trades")
+    log(
+        f"  Current fast-market P&L: {display_pnl_text} across "
+        f"{display_open_positions} open positions (open exposure ${display_open_exposure:.2f})"
+    )
 
     if show_config:
         config_path = get_config_path(__file__)
@@ -988,13 +1010,16 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if dry_run:
         if paper_state["realized_pnl"] <= -abs(DAILY_LOSS_LIMIT):
             _activate_loss_pause(__file__, paper_state["realized_pnl"], reason="paper_daily_loss_stop")
-            log(f"\n🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            log(f"
+🛑 Daily paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
     else:
-        live_realized_pnl = _extract_live_realized_pnl()
-        if live_realized_pnl is not None and live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
+        if live_realized_pnl is None:
+            log("  ⚠️  Could not read live realized P&L from portfolio API.", force=True)
+        elif live_realized_pnl <= -abs(DAILY_LOSS_LIMIT):
             _activate_loss_pause(__file__, live_realized_pnl, reason="live_daily_loss_stop")
-            log(f"\n🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
+            log(f"
+🛑 Live realized loss limit reached (${live_realized_pnl:.2f}). Pausing new entries for {PAUSE_HOURS_AFTER_LOSS}h.", force=True)
             return
 
     # Show positions if requested
