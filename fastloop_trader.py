@@ -51,7 +51,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "max_position": {"default": 20.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+    "max_position": {"default": 1.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance)"},
@@ -67,7 +67,7 @@ CONFIG_SCHEMA = {
                           "help": "Weight signal by volume (higher volume = more confident)"},
     "daily_budget": {"default": 0.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
                      "help": "Legacy budget cap (unused)"},
-    "max_open_exposure": {"default": 20.0, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
+    "max_open_exposure": {"default": 1.0, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
                             "help": "Maximum simultaneous open exposure across active positions"},
     "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
                         "help": "Take profit percentage for position exits"},
@@ -415,7 +415,7 @@ def _current_live_locked_exposure(state):
     return round(sum(float(lock.get("entry_cost", 0.0) or 0.0) for lock in state.get("market_locks", [])), 6)
 
 
-def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side):
+def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side, shares=None, entry_price=None, entry_time=None):
     state = _prune_live_runtime_state(skill_file)
     key = _market_lock_key(market_id=market_id, question=question)
     if not key:
@@ -431,6 +431,10 @@ def _register_live_market_lock(skill_file, market_id, question, end_time, entry_
         "question": question,
         "entry_cost": round(float(entry_cost), 6),
         "side": side,
+        "shares": round(float(shares), 6) if shares else None,
+        "entry_price": round(float(entry_price), 6) if entry_price is not None else None,
+        "entry_time": entry_time or datetime.now(timezone.utc).isoformat(),
+        "closed": False,
         "until": end_time.isoformat(),
     })
     _save_live_runtime_state(skill_file, state)
@@ -471,6 +475,164 @@ def _infer_live_fill_price(position_size, shares, quoted_price):
     except Exception:
         pass
     return float(quoted_price)
+
+
+def _position_side_from_dict(pos):
+    yes = float(pos.get("shares_yes", 0) or 0)
+    no = float(pos.get("shares_no", 0) or 0)
+    if yes > 0 and yes >= no:
+        return "yes"
+    if no > 0:
+        return "no"
+    return None
+
+
+def _position_shares_for_side(pos, side):
+    if side == "yes":
+        return float(pos.get("shares_yes", 0) or 0)
+    if side == "no":
+        return float(pos.get("shares_no", 0) or 0)
+    return 0.0
+
+
+def _get_live_market_lock(state, market_id=None, question=None):
+    key = _market_lock_key(market_id=market_id, question=question)
+    if not key:
+        return None
+    for lock in state.get("market_locks", []):
+        if lock.get("key") == key:
+            return lock
+    return None
+
+
+def _mark_live_market_lock_closed(skill_file, market_id=None, question=None):
+    state = _prune_live_runtime_state(skill_file)
+    key = _market_lock_key(market_id=market_id, question=question)
+    changed = False
+    for lock in state.get("market_locks", []):
+        if lock.get("key") == key:
+            lock["entry_cost"] = 0.0
+            lock["closed"] = True
+            changed = True
+    if changed:
+        _save_live_runtime_state(skill_file, state)
+    return state
+
+
+def _best_live_entry_cost(pos, runtime_state=None):
+    for key in ("entry_cost", "cost_basis", "notional_usdc"):
+        try:
+            value = float(pos.get(key, 0) or 0)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    try:
+        current_value = float(pos.get("current_value", 0) or 0)
+        pnl = float(pos.get("pnl", 0) or 0)
+        inferred = current_value - pnl
+        if inferred > 0:
+            return inferred
+    except Exception:
+        pass
+    if runtime_state is not None:
+        lock = _get_live_market_lock(runtime_state, market_id=pos.get("market_id"), question=pos.get("question"))
+        if lock:
+            try:
+                value = float(lock.get("entry_cost", 0) or 0)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    return 0.0
+
+
+def _position_end_time(pos):
+    for key in ("resolves_at", "end_time", "until"):
+        val = pos.get(key)
+        dt = _parse_resolves_at(val) if isinstance(val, str) else None
+        if dt is not None:
+            return dt
+    q = pos.get("question", "")
+    return _parse_fast_market_end_time(q) if q else None
+
+
+def _set_live_monitor(market_id, side, log):
+    try:
+        client = get_client()
+        client.set_monitor(market_id, side=side, stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT)
+        log(f"  🛡️  Live monitor armed for {side.upper()} ({STOP_LOSS_PCT:.0%} stop / {TAKE_PROFIT_PCT:.0%} take profit)")
+        return True
+    except Exception as e:
+        log(f"  ⚠️  Could not set live monitor: {e}")
+        return False
+
+
+def manage_live_positions(skill_file, log):
+    """Actively exit live positions on stop-loss / take-profit / near-expiry loss."""
+    state = _prune_live_runtime_state(skill_file)
+    positions = get_positions()
+    if not positions:
+        return state, []
+
+    closed = []
+    now = datetime.now(timezone.utc)
+
+    for pos in positions:
+        question = pos.get("question", "") or ""
+        if "up or down" not in question.lower():
+            continue
+        side = _position_side_from_dict(pos)
+        if side not in ("yes", "no"):
+            continue
+        shares = _position_shares_for_side(pos, side)
+        if shares <= 0:
+            continue
+
+        entry_cost = _best_live_entry_cost(pos, state)
+        if entry_cost <= 0:
+            continue
+        pnl = float(pos.get("pnl", 0) or 0)
+        current_value = float(pos.get("current_value", 0) or 0)
+        pnl_pct = pnl / entry_cost if entry_cost > 0 else None
+        end_time = _position_end_time(pos)
+        seconds_left = (end_time - now).total_seconds() if end_time else None
+
+        reason = None
+        if pnl_pct is not None and pnl_pct <= -abs(STOP_LOSS_PCT):
+            reason = "stop_loss"
+        elif pnl_pct is not None and pnl_pct >= abs(TAKE_PROFIT_PCT):
+            reason = "take_profit"
+        elif seconds_left is not None and seconds_left <= RESOLUTION_EXIT_SECONDS and pnl < 0:
+            reason = "time_exit"
+
+        if not reason:
+            continue
+
+        result = execute_trade(pos.get("market_id"), side, shares=shares, action="sell")
+        if result and result.get("success"):
+            proceeds = float(result.get("cost") or current_value or 0.0)
+            avg_exit = (proceeds / shares) if shares > 0 and proceeds > 0 else None
+            log(
+                f"  ✅ Sold {shares:.2f} {side.upper()} shares"
+                + (f" @ ${avg_exit:.3f}" if avg_exit else "")
+                + f" ({reason}, est P&L ${pnl:.2f})",
+                force=True,
+            )
+            _mark_live_market_lock_closed(skill_file, market_id=pos.get("market_id"), question=question)
+            closed.append({
+                "market_id": pos.get("market_id"),
+                "question": question,
+                "side": side,
+                "shares": shares,
+                "reason": reason,
+                "estimated_pnl": round(pnl, 6),
+            })
+        else:
+            err = result.get("error", "Unknown error") if result else "No response"
+            log(f"  ❌ Live sell failed on {question[:45]}... ({reason}): {err}", force=True)
+
+    return _prune_live_runtime_state(skill_file), closed
 
 
 def _extract_live_pnl_fields():
@@ -1212,14 +1374,15 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Loss stop:        -${DAILY_LOSS_LIMIT:.2f} then pause {PAUSE_HOURS_AFTER_LOSS}h")
     log(f"  {budget_label}:     ${budget_spent:.2f} cumulative, {budget_trades} trades")
 
+    pnl_label = "Current paper P&L" if dry_run else "Current total live P&L"
     if display_pnl is None:
         log(
-            f"  Current fast-market P&L: unavailable across "
+            f"  {pnl_label}: unavailable across "
             f"{display_open_positions} open positions (open exposure ${display_open_exposure:.2f})"
         )
     else:
         log(
-            f"  Current fast-market P&L: ${display_pnl:.2f} across "
+            f"  {pnl_label}: ${display_pnl:.2f} across "
             f"{display_open_positions} open positions (open exposure ${display_open_exposure:.2f})"
         )
 
@@ -1235,8 +1398,18 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Initialize client early to validate API key (paper mode when not live)
     get_client(live=not dry_run)
 
-    # Manage paper exits before looking for fresh entries
+    if not dry_run:
+        try:
+            redeem_results = get_client().auto_redeem()
+            redeemed = [r for r in (redeem_results or []) if isinstance(r, dict) and r.get("success")]
+            if redeemed:
+                log(f"  ✅ Auto-redeemed {len(redeemed)} resolved winning position(s).", force=True)
+        except Exception as e:
+            log(f"  ⚠️  Auto-redeem skipped: {e}")
+
+    # Manage exits before looking for fresh entries
     paper_state, closed_paper_positions = manage_paper_positions(__file__, log)
+    live_runtime_state, closed_live_positions = manage_live_positions(__file__, log) if not dry_run else (live_runtime_state, [])
 
     guard_state, pause_remaining = _guard_pause_remaining(__file__)
     if pause_remaining > 0:
@@ -1586,7 +1759,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     execution_error = None
     tag = "SIMULATED" if dry_run else "LIVE"
     log(f"  Executing {side.upper()} trade for ${position_size:.2f} ({tag})...", force=True)
-    result = execute_trade(market_id, side, position_size)
+    result = execute_trade(market_id, side, amount=position_size, action="buy")
 
     if result and result.get("success"):
         shares = float(result.get("shares_bought") or result.get("shares") or 0)
@@ -1630,7 +1803,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 end_time=end_time,
                 entry_cost=position_size,
                 side=side,
+                shares=shares,
+                entry_price=display_fill_price,
+                entry_time=datetime.now(timezone.utc).isoformat(),
             )
+            _set_live_monitor(market_id, side, log)
 
         # Log to trade journal (skip for paper trades)
         if trade_id and JOURNAL_AVAILABLE and not result.get("simulated"):
