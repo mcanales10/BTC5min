@@ -69,9 +69,9 @@ CONFIG_SCHEMA = {
                      "help": "Legacy budget cap (unused)"},
     "max_open_exposure": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
                             "help": "Maximum simultaneous open exposure across active positions"},
-    "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
+    "take_profit_pct": {"default": 0.15, "env": "SIMMER_SPRINT_TP", "type": float,
                         "help": "Take profit percentage for position exits"},
-    "stop_loss_pct": {"default": 0.10, "env": "SIMMER_SPRINT_SL", "type": float,
+    "stop_loss_pct": {"default": 0.08, "env": "SIMMER_SPRINT_SL", "type": float,
                       "help": "Stop loss percentage for position exits"},
     "daily_loss_limit": {"default": 20.0, "env": "SIMMER_SPRINT_DAILY_LOSS", "type": float,
                          "help": "Stop trading after this much realized loss in a UTC day"},
@@ -81,7 +81,7 @@ CONFIG_SCHEMA = {
                            "help": "Legacy trade cap (unused)"},
     "pause_hours_after_loss": {"default": 24, "env": "SIMMER_SPRINT_PAUSE_HOURS", "type": int,
                            "help": "Pause new entries for this many hours after loss stop is hit"},
-    "resolution_exit_seconds": {"default": 15, "env": "SIMMER_SPRINT_RESOLVE_EXIT", "type": int,
+    "resolution_exit_seconds": {"default": 60, "env": "SIMMER_SPRINT_RESOLVE_EXIT", "type": int,
                                 "help": "Exit paper positions this many seconds before market expiry if still open"},
 }
 
@@ -100,6 +100,10 @@ CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
+SINGLE_POSITION_LIVE_MODE = True
+ENABLE_CONTRARIAN = False
+LIVE_TIME_STOP_SECONDS = 60
+LIVE_MAX_HOLD_SECONDS = 90
 
 # Asset → Binance symbol mapping
 ASSET_SYMBOLS = {
@@ -440,6 +444,57 @@ def _register_live_market_lock(skill_file, market_id, question, end_time, entry_
     _save_live_runtime_state(skill_file, state)
     return state
 
+def _get_live_trade_ledger_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "live_trade_ledger.jsonl"
+
+
+def _append_live_trade_event(skill_file, event):
+    path = _get_live_trade_ledger_path(skill_file)
+    payload = dict(event)
+    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _find_live_position(market_id=None, question=None, side=None):
+    positions = get_positions()
+    qnorm = (question or "").strip().lower()
+    for pos in positions or []:
+        pq = (pos.get("question") or "").strip().lower()
+        if market_id and pos.get("market_id") != market_id and qnorm and pq != qnorm:
+            continue
+        if not market_id and qnorm and pq != qnorm:
+            continue
+        pside = _position_side_from_dict(pos)
+        if side and pside != side:
+            continue
+        shares = _position_shares_for_side(pos, pside)
+        if shares > 0:
+            return pos
+    return None
+
+
+def _confirm_live_fill(skill_file, market_id, question, side, entry_cost, quoted_price, shares_hint=0.0, attempts=4, sleep_seconds=1.0):
+    confirmed = None
+    for _ in range(max(1, attempts)):
+        pos = _find_live_position(market_id=market_id, question=question, side=side)
+        if pos:
+            confirmed = pos
+            break
+        time.sleep(max(0.0, sleep_seconds))
+    shares = float(shares_hint or 0.0)
+    avg_fill = float(quoted_price)
+    if confirmed:
+        shares = _position_shares_for_side(confirmed, side) or shares
+        actual_cost = _best_live_entry_cost(confirmed) or float(entry_cost)
+        if shares > 0 and actual_cost > 0:
+            avg_fill = actual_cost / shares
+        return confirmed, shares, actual_cost, avg_fill
+    if shares > 0 and entry_cost > 0:
+        avg_fill = float(entry_cost) / shares
+    return None, shares, float(entry_cost), avg_fill
+
 
 def _current_paper_open_exposure(state):
     return round(sum(float(p.get("entry_cost", 0.0)) for p in state.get("open_positions", [])), 6)
@@ -569,7 +624,7 @@ def _set_live_monitor(market_id, side, log):
 
 
 def manage_live_positions(skill_file, log):
-    """Actively exit live positions on stop-loss / take-profit / near-expiry loss."""
+    """Actively exit live positions and never scan for fresh entries while one is open."""
     state = _prune_live_runtime_state(skill_file)
     positions = get_positions()
     if not positions:
@@ -589,29 +644,33 @@ def manage_live_positions(skill_file, log):
         if shares <= 0:
             continue
 
+        lock = _get_live_market_lock(state, market_id=pos.get("market_id"), question=question)
         entry_cost = _best_live_entry_cost(pos, state)
         if entry_cost <= 0:
             continue
         pnl = float(pos.get("pnl", 0) or 0)
-        current_value = float(pos.get("current_value", 0) or 0)
         pnl_pct = pnl / entry_cost if entry_cost > 0 else None
         end_time = _position_end_time(pos)
         seconds_left = (end_time - now).total_seconds() if end_time else None
+        entry_time = _parse_iso_dt((lock or {}).get("entry_time"))
+        hold_seconds = (now - entry_time).total_seconds() if entry_time else None
 
         reason = None
         if pnl_pct is not None and pnl_pct <= -abs(STOP_LOSS_PCT):
             reason = "stop_loss"
         elif pnl_pct is not None and pnl_pct >= abs(TAKE_PROFIT_PCT):
             reason = "take_profit"
-        elif seconds_left is not None and seconds_left <= RESOLUTION_EXIT_SECONDS and pnl < 0:
+        elif seconds_left is not None and seconds_left <= LIVE_TIME_STOP_SECONDS and pnl < 0:
             reason = "time_exit"
+        elif hold_seconds is not None and hold_seconds >= LIVE_MAX_HOLD_SECONDS and pnl < 0:
+            reason = "max_hold_exit"
 
         if not reason:
             continue
 
         result = execute_trade(pos.get("market_id"), side, shares=shares, action="sell")
         if result and result.get("success"):
-            proceeds = float(result.get("cost") or current_value or 0.0)
+            proceeds = float(result.get("cost") or float(pos.get("current_value", 0) or 0.0) or 0.0)
             avg_exit = (proceeds / shares) if shares > 0 and proceeds > 0 else None
             log(
                 f"  ✅ Sold {shares:.2f} {side.upper()} shares"
@@ -620,6 +679,18 @@ def manage_live_positions(skill_file, log):
                 force=True,
             )
             _mark_live_market_lock_closed(skill_file, market_id=pos.get("market_id"), question=question)
+            _append_live_trade_event(skill_file, {
+                "type": "exit",
+                "market_id": pos.get("market_id"),
+                "question": question,
+                "side": side,
+                "shares": shares,
+                "entry_cost": round(entry_cost, 6),
+                "exit_value": round(proceeds, 6),
+                "avg_exit": round(avg_exit, 6) if avg_exit else None,
+                "reason": reason,
+                "estimated_pnl": round(pnl, 6),
+            })
             closed.append({
                 "market_id": pos.get("market_id"),
                 "question": question,
@@ -1358,8 +1429,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below 0.35 | contrarian below 0.15 or above 0.85")
-    log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%}")
+    log(f"  Entry rules:      momentum only below 0.35 | contrarian disabled")
+    log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
@@ -1655,7 +1726,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Volume confidence adjustment
     vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.5:
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < (0.75 if not dry_run else 0.5):
         log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
         if not quiet:
             print(f"📊 Summary: No trade (low volume)")
@@ -1707,12 +1778,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
-    if price < CONTRARIAN_LOW or price > CONTRARIAN_HIGH:
-        strategy_mode = "contrarian_extreme"
-    elif price < MOMENTUM_MAX_ENTRY:
+    if price < MOMENTUM_MAX_ENTRY:
         strategy_mode = "momentum"
     else:
-        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for both momentum and contrarian modes")
+        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for momentum mode (< ${MOMENTUM_MAX_ENTRY:.2f})")
         skip_reasons.append("price filter")
         _emit_skip_report()
         return
@@ -1779,11 +1848,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         shares = float(result.get("shares_bought") or result.get("shares") or 0)
         trade_id = result.get("trade_id")
         display_fill_price = price if result.get("simulated") else _infer_live_fill_price(position_size, shares, price)
-        log(
-            f"  ✅ {'[PAPER] ' if result.get('simulated') else ''}Bought {shares:.1f} {side.upper()} shares @ ${display_fill_price:.3f}"
-            + ("" if result.get("simulated") else f" (avg fill est; quote was ${price:.3f})"),
-            force=True,
-        )
+        if result.get("simulated"):
+            log(
+                f"  ✅ [PAPER] Bought {shares:.1f} {side.upper()} shares @ ${display_fill_price:.3f}",
+                force=True,
+            )
 
         if result.get("simulated"):
             target_price = round(price * (1 + TAKE_PROFIT_PCT), 6)
@@ -1807,7 +1876,24 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             _save_paper_state(__file__, paper_state)
             log(f"  📒 [PAPER] Tracking position with TP ${target_price:.3f} / SL ${stop_price:.3f}", force=True)
         else:
-            live_spend["spent"] += position_size
+            confirmed_pos, confirmed_shares, confirmed_cost, confirmed_fill = _confirm_live_fill(
+                __file__,
+                market_id=market_id,
+                question=best.get("question", ""),
+                side=side,
+                entry_cost=position_size,
+                quoted_price=price,
+                shares_hint=shares,
+            )
+            shares = float(confirmed_shares or shares or 0.0)
+            display_fill_price = float(confirmed_fill or display_fill_price)
+            actual_cost = float(confirmed_cost or position_size)
+            log(
+                f"  ✅ Bought {shares:.2f} {side.upper()} shares @ ${display_fill_price:.3f}"
+                + (f" (confirmed fill; quote was ${price:.3f})" if abs(display_fill_price - price) > 1e-6 else ""),
+                force=True,
+            )
+            live_spend["spent"] += actual_cost
             live_spend["trades"] += 1
             _save_daily_spend(__file__, live_spend)
             _register_live_market_lock(
@@ -1815,12 +1901,26 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 market_id=market_id,
                 question=best.get("question", ""),
                 end_time=end_time,
-                entry_cost=position_size,
+                entry_cost=actual_cost,
                 side=side,
                 shares=shares,
                 entry_price=display_fill_price,
                 entry_time=datetime.now(timezone.utc).isoformat(),
             )
+            _append_live_trade_event(__file__, {
+                "type": "entry",
+                "market_id": market_id,
+                "question": best.get("question", ""),
+                "side": side,
+                "quoted_price": round(price, 6),
+                "avg_fill": round(display_fill_price, 6),
+                "shares": round(shares, 6),
+                "entry_cost": round(actual_cost, 6),
+                "strategy_mode": strategy_mode,
+                "momentum_pct": round(momentum["momentum_pct"], 6),
+                "volume_ratio": round(momentum["volume_ratio"], 6),
+                "divergence": round(divergence, 6),
+            })
             _set_live_monitor(market_id, side, log)
 
         # Log to trade journal (skip for paper trades)
