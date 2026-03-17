@@ -100,6 +100,7 @@ CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
+ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -1409,8 +1410,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     """Run one cycle of the fast_market trading strategy."""
 
     def log(msg, force=False):
-        """Print unless quiet mode is on. force=True always prints."""
-        if not quiet or force:
+        """Action-oriented logger: print only forced/action lines unless full logging is enabled."""
+        if force or (not quiet and not ACTION_ONLY_LOGS):
             print(msg)
 
     log("⚡ Simmer FastLoop Trading Skill")
@@ -1559,7 +1560,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if not markets:
         log("  No active fast markets found — may be outside market hours or wrong asset/window")
         log(f"  Check: asset={ASSET}, window={WINDOW}")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print("📊 Summary: No markets available")
         return
 
@@ -1576,7 +1577,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 secs_left = (end_time - now).total_seconds()
                 log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
         log(f"  No live tradeable markets among {len(markets)} found — waiting for next window")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No tradeable markets (0/{len(markets)} live with enough time)")
         return
 
@@ -1596,21 +1597,21 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             continue
         if (_mid and pos.get("market_id") == _mid) or (_q and pos.get("question", "").lower() == _q):
             log(f"  ⏸️  Already holding position on this market — skip (dedup)")
-            if not quiet:
+            if not quiet and not ACTION_ONLY_LOGS:
                 print(f"📊 Summary: No trade (already holding this market)")
             skip_reasons.append("already holding")
             return
 
     if _paper_has_open_position(paper_state, market_id=_mid, question=best.get("question", "")):
         log(f"  ⏸️  Already holding PAPER position on this market — skip (dedup)")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (already holding this market)")
         skip_reasons.append("already holding paper position")
         return
 
     if not dry_run and _live_market_lock_active(live_runtime_state, market_id=_mid, question=best.get("question", "")):
         log(f"  ⏸️  Live market lock active for this market — skip (dedup)")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (market lock active)")
         skip_reasons.append("live market lock active")
         return
@@ -1624,7 +1625,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     else:
         log(f"  ⏸️  Could not fetch live CLOB price — skipping (stale prices are unsafe on fast markets)")
         _set_market_cooldown(__file__, best)
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (CLOB price unavailable)")
         return
 
@@ -1679,7 +1680,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Spread: {pre_spread:.1f}¢ ({best.get('liquidity_tier', 'unknown')})")
         if spread_pct > MAX_SPREAD_PCT:
             log(f"  ⏸️  Spread {spread_pct:.1%} > max {MAX_SPREAD_PCT:.1%} — illiquid, skip")
-            if not quiet:
+            if not quiet and not ACTION_ONLY_LOGS:
                 print(f"📊 Summary: No trade (wide spread: {spread_pct:.1%})")
             skip_reasons.append("wide spread")
             _emit_skip_report()
@@ -1692,7 +1693,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             if book["spread_pct"] > MAX_SPREAD_PCT:
                 log(f"  ⏸️  Spread {book['spread_pct']:.1%} > max {MAX_SPREAD_PCT:.1%}")
                 _set_market_cooldown(__file__, best)
-                if not quiet:
+                if not quiet and not ACTION_ONLY_LOGS:
                     print(f"📊 Summary: No trade (wide spread)")
                 skip_reasons.append("wide spread")
                 _emit_skip_report()
@@ -1700,7 +1701,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         else:
             log("  ⏸️  Could not fetch usable order book — skip")
             _set_market_cooldown(__file__, best)
-            if not quiet:
+            if not quiet and not ACTION_ONLY_LOGS:
                 print("📊 Summary: No trade (order book unavailable)")
             skip_reasons.append("order book unavailable")
             _emit_skip_report()
@@ -1709,7 +1710,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
         log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return
 
@@ -1728,7 +1729,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     vol_note = ""
     if VOLUME_CONFIDENCE and momentum["volume_ratio"] < (0.75 if not dry_run else 0.5):
         log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (low volume)")
         skip_reasons.append("low volume")
         _emit_skip_report()
@@ -1739,7 +1740,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Check divergence threshold
     if divergence <= 0:
         log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (market already priced in)")
         skip_reasons.append("market already priced in")
         _emit_skip_report()
@@ -1760,7 +1761,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Fee:              ${fee_per_share:.4f}/share ({effective_fee_rate:.2%} effective, min divergence {min_divergence:.3f})")
         if divergence < min_divergence:
             log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
-            if not quiet:
+            if not quiet and not ACTION_ONLY_LOGS:
                 print(f"📊 Summary: No trade (fees eat the edge)")
             skip_reasons.append("fees eat the edge")
             _emit_skip_report()
@@ -1799,7 +1800,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     remaining_exposure = MAX_OPEN_EXPOSURE - current_open_exposure
     if remaining_exposure <= 0:
         log(f"  ⏸️  Open exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) — skip")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (open exposure cap reached)")
         skip_reasons.append("open exposure cap")
         _emit_skip_report()
@@ -1809,7 +1810,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Exposure cap: trade capped at ${position_size:.2f} (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f} currently open)")
     if position_size < 0.50:
         log(f"  ⏸️  Remaining exposure room ${position_size:.2f} < $0.50 — skip")
-        if not quiet:
+        if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (exposure room too small)")
         skip_reasons.append("exposure room too small")
         _emit_skip_report()
@@ -1943,7 +1944,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Summary
     total_trades = 1 if result and result.get("success") else 0
-    show_summary = not quiet or total_trades > 0
+    show_summary = total_trades > 0 or bool(execution_error)
     if show_summary:
         print(f"\n📊 Summary:")
         print(f"  Sprint: {best['question'][:50]}")
@@ -2030,5 +2031,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Loop error: {e}")
 
-        print(f"\n⏳ Waiting {SCAN_INTERVAL_SECONDS} seconds before next scan...\n")
+        if not ACTION_ONLY_LOGS:
+            print(f"\n⏳ Waiting {SCAN_INTERVAL_SECONDS} seconds before next scan...\n")
         time.sleep(SCAN_INTERVAL_SECONDS)
