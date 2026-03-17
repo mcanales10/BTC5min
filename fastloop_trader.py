@@ -100,6 +100,7 @@ CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
+LIVE_SCAN_INTERVAL_SECONDS = 15  # faster loop while running in live mode
 HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 _last_heartbeat_ts = 0
@@ -2038,6 +2039,7 @@ if __name__ == "__main__":
             _last_heartbeat_ts = now_ts
             print(f"💓 Heartbeat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} | bot alive | monitoring for entry/exit")
 
+        sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS if args.live else SCAN_INTERVAL_SECONDS
         if not ACTION_ONLY_LOGS:
-            print(f"\n⏳ Waiting {SCAN_INTERVAL_SECONDS} seconds before next scan...\n")
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            print(f"\n⏳ Waiting {sleep_seconds} seconds before next scan...\n")
+        time.sleep(sleep_seconds)
