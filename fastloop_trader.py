@@ -100,7 +100,9 @@ CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
+HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
+_last_heartbeat_ts = 0
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -2030,6 +2032,11 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"Loop error: {e}")
+
+        now_ts = time.time()
+        if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
+            _last_heartbeat_ts = now_ts
+            print(f"💓 Heartbeat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} | bot alive | monitoring for entry/exit")
 
         if not ACTION_ONLY_LOGS:
             print(f"\n⏳ Waiting {SCAN_INTERVAL_SECONDS} seconds before next scan...\n")
