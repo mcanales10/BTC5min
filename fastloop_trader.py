@@ -51,7 +51,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "max_position": {"default": 1.0, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
+    "max_position": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
                       "help": "Price feed source (binance)"},
@@ -67,7 +67,7 @@ CONFIG_SCHEMA = {
                           "help": "Weight signal by volume (higher volume = more confident)"},
     "daily_budget": {"default": 0.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
                      "help": "Legacy budget cap (unused)"},
-    "max_open_exposure": {"default": 1.0, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
+    "max_open_exposure": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
                             "help": "Maximum simultaneous open exposure across active positions"},
     "take_profit_pct": {"default": 0.20, "env": "SIMMER_SPRINT_TP", "type": float,
                         "help": "Take profit percentage for position exits"},
@@ -1280,22 +1280,36 @@ def get_positions():
         return []
 
 
-def execute_trade(market_id, side, amount):
-    """Execute a trade on Simmer."""
+def execute_trade(market_id, side, amount=None, shares=None, action="buy"):
+    """Execute a trade on Simmer.
+
+    For buys, pass `amount` in USDC.e. For sells, pass `shares` to close.
+    This wrapper is intentionally flexible because the strategy uses both
+    buy-notional and sell-shares flows.
+    """
     try:
-        result = get_client().trade(
-            market_id=market_id,
-            side=side,
-            amount=amount,
-            source=TRADE_SOURCE, skill_slug=SKILL_SLUG,
-        )
+        kwargs = {
+            "market_id": market_id,
+            "side": side,
+            "source": TRADE_SOURCE,
+            "skill_slug": SKILL_SLUG,
+        }
+        if action:
+            kwargs["action"] = action
+        if amount is not None:
+            kwargs["amount"] = amount
+        if shares is not None:
+            kwargs["shares"] = shares
+
+        result = get_client().trade(**kwargs)
         return {
-            "success": result.success,
-            "trade_id": result.trade_id,
-            "shares_bought": result.shares_bought,
-            "shares": result.shares_bought,
-            "error": result.error,
-            "simulated": result.simulated,
+            "success": getattr(result, "success", False),
+            "trade_id": getattr(result, "trade_id", None),
+            "shares_bought": getattr(result, "shares_bought", None),
+            "shares": getattr(result, "shares_bought", None) or shares,
+            "cost": getattr(result, "cost", None),
+            "error": getattr(result, "error", None),
+            "simulated": getattr(result, "simulated", False),
         }
     except Exception as e:
         return {"error": str(e)}
