@@ -423,7 +423,7 @@ def _current_live_locked_exposure(state):
     return round(sum(float(lock.get("entry_cost", 0.0) or 0.0) for lock in state.get("market_locks", [])), 6)
 
 
-def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side, shares=None, entry_price=None, entry_time=None):
+def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side, shares=None, entry_price=None, entry_time=None, clob_token_ids=None):
     state = _prune_live_runtime_state(skill_file)
     key = _market_lock_key(market_id=market_id, question=question)
     if not key:
@@ -442,6 +442,7 @@ def _register_live_market_lock(skill_file, market_id, question, end_time, entry_
         "shares": round(float(shares), 6) if shares else None,
         "entry_price": round(float(entry_price), 6) if entry_price is not None else None,
         "entry_time": entry_time or datetime.now(timezone.utc).isoformat(),
+        "clob_token_ids": list(clob_token_ids) if clob_token_ids else None,
         "closed": False,
         "until": end_time.isoformat(),
     })
@@ -627,6 +628,7 @@ def _set_live_monitor(market_id, side, log):
         return False
 
 
+
 def manage_live_positions(skill_file, log):
     """Actively exit live positions and never scan for fresh entries while one is open."""
     state = _prune_live_runtime_state(skill_file)
@@ -650,23 +652,31 @@ def manage_live_positions(skill_file, log):
 
         lock = _get_live_market_lock(state, market_id=pos.get("market_id"), question=question)
         entry_cost = _best_live_entry_cost(pos, state)
-        if entry_cost <= 0:
+        entry_price = _best_live_entry_price(pos, state)
+        if entry_cost <= 0 or entry_price <= 0:
             continue
-        pnl = float(pos.get("pnl", 0) or 0)
-        pnl_pct = pnl / entry_cost if entry_cost > 0 else None
+
+        current_price, price_source = _get_live_current_side_price(pos, side, state)
+        if current_price is None:
+            continue
+
         end_time = _position_end_time(pos)
         seconds_left = (end_time - now).total_seconds() if end_time else None
         entry_time = _parse_iso_dt((lock or {}).get("entry_time"))
         hold_seconds = (now - entry_time).total_seconds() if entry_time else None
 
+        target_price = min(0.999, round(entry_price * (1 + TAKE_PROFIT_PCT), 6))
+        stop_price = max(0.001, round(entry_price * (1 - STOP_LOSS_PCT), 6))
+        est_pnl = shares * (current_price - entry_price)
+
         reason = None
-        if pnl_pct is not None and pnl_pct <= -abs(STOP_LOSS_PCT):
-            reason = "stop_loss"
-        elif pnl_pct is not None and pnl_pct >= abs(TAKE_PROFIT_PCT):
+        if current_price >= target_price:
             reason = "take_profit"
-        elif seconds_left is not None and seconds_left <= LIVE_TIME_STOP_SECONDS and pnl < 0:
+        elif current_price <= stop_price:
+            reason = "stop_loss"
+        elif seconds_left is not None and seconds_left <= LIVE_TIME_STOP_SECONDS and est_pnl < 0:
             reason = "time_exit"
-        elif hold_seconds is not None and hold_seconds >= LIVE_MAX_HOLD_SECONDS and pnl < 0:
+        elif hold_seconds is not None and hold_seconds >= LIVE_MAX_HOLD_SECONDS and est_pnl < 0:
             reason = "max_hold_exit"
 
         if not reason:
@@ -674,12 +684,12 @@ def manage_live_positions(skill_file, log):
 
         result = execute_trade(pos.get("market_id"), side, shares=shares, action="sell")
         if result and result.get("success"):
-            proceeds = float(result.get("cost") or float(pos.get("current_value", 0) or 0.0) or 0.0)
-            avg_exit = (proceeds / shares) if shares > 0 and proceeds > 0 else None
+            proceeds = float(result.get("cost") or 0.0)
+            avg_exit = (proceeds / shares) if shares > 0 and proceeds > 0 else current_price
+            realized = shares * ((avg_exit or current_price) - entry_price)
             log(
-                f"  ✅ Sold {shares:.2f} {side.upper()} shares"
-                + (f" @ ${avg_exit:.3f}" if avg_exit else "")
-                + f" ({reason}, est P&L ${pnl:.2f})",
+                f"  ✅ Sold {shares:.2f} {side.upper()} shares @ ${(avg_exit or current_price):.3f} "
+                f"({reason}, est P&L ${realized:.2f})",
                 force=True,
             )
             _mark_live_market_lock_closed(skill_file, market_id=pos.get("market_id"), question=question)
@@ -690,10 +700,15 @@ def manage_live_positions(skill_file, log):
                 "side": side,
                 "shares": shares,
                 "entry_cost": round(entry_cost, 6),
+                "entry_price": round(entry_price, 6),
+                "trigger_price": round(current_price, 6),
+                "trigger_source": price_source,
+                "target_price": round(target_price, 6),
+                "stop_price": round(stop_price, 6),
                 "exit_value": round(proceeds, 6),
                 "avg_exit": round(avg_exit, 6) if avg_exit else None,
                 "reason": reason,
-                "estimated_pnl": round(pnl, 6),
+                "estimated_pnl": round(realized, 6),
             })
             closed.append({
                 "market_id": pos.get("market_id"),
@@ -701,11 +716,16 @@ def manage_live_positions(skill_file, log):
                 "side": side,
                 "shares": shares,
                 "reason": reason,
-                "estimated_pnl": round(pnl, 6),
+                "estimated_pnl": round(realized, 6),
             })
         else:
             err = result.get("error", "Unknown error") if result else "No response"
-            log(f"  ❌ Live sell failed on {question[:45]}... ({reason}): {err}", force=True)
+            log(
+                f"  ❌ Live sell failed on {question[:45]}... "
+                f"({reason}, entry ${entry_price:.3f}, now ${current_price:.3f} via {price_source}, "
+                f"TP ${target_price:.3f}, SL ${stop_price:.3f}): {err}",
+                force=True,
+            )
 
     return _prune_live_runtime_state(skill_file), closed
 
@@ -1070,6 +1090,206 @@ def fetch_orderbook_summary(clob_token_ids):
         }
     except (KeyError, ValueError, IndexError, TypeError):
         return None
+
+
+def fetch_side_orderbook_summary(clob_token_ids, side="yes"):
+    """Fetch order book summary for the requested side token."""
+    if not clob_token_ids:
+        return None
+    idx = 0 if side == "yes" else 1
+    if len(clob_token_ids) <= idx:
+        return None
+    token_id = clob_token_ids[idx]
+    result = _api_request(f"{CLOB_API}/book?token_id={quote(str(token_id))}", timeout=5)
+    if not result or not isinstance(result, dict):
+        return None
+    bids = result.get("bids", []) or []
+    asks = result.get("asks", []) or []
+    try:
+        best_bid = float(bids[0]["price"]) if bids else None
+        best_ask = float(asks[0]["price"]) if asks else None
+        mid = None
+        spread_pct = None
+        if best_bid is not None and best_ask is not None:
+            spread = best_ask - best_bid
+            mid = (best_ask + best_bid) / 2
+            spread_pct = spread / mid if mid and mid > 0 else None
+        bid_depth = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids[:5]) if bids else 0.0
+        ask_depth = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks[:5]) if asks else 0.0
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread_pct": spread_pct,
+            "bid_depth_usd": bid_depth,
+            "ask_depth_usd": ask_depth,
+        }
+    except (KeyError, ValueError, IndexError, TypeError):
+        return None
+
+
+def _normalize_dict_like(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    try:
+        from dataclasses import asdict, is_dataclass
+        if is_dataclass(obj):
+            return asdict(obj)
+    except Exception:
+        pass
+    if hasattr(obj, "model_dump"):
+        try:
+            dumped = obj.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if hasattr(obj, "_asdict"):
+        try:
+            dumped = obj._asdict()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            dumped = vars(obj)
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    return None
+
+
+def _extract_clob_token_ids_from_obj(obj):
+    data = _normalize_dict_like(obj)
+    if not data:
+        return None
+
+    direct = data.get("clob_token_ids")
+    if isinstance(direct, list) and direct:
+        return direct
+
+    yes_token = data.get("polymarket_token_id") or data.get("yes_token_id")
+    no_token = data.get("polymarket_no_token_id") or data.get("no_token_id")
+    if yes_token and no_token:
+        return [yes_token, no_token]
+    if yes_token:
+        return [yes_token]
+
+    raw = data.get("clobTokenIds")
+    if isinstance(raw, list) and raw:
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and parsed:
+                return parsed
+        except Exception:
+            pass
+    return None
+
+
+def _get_position_clob_token_ids(pos, runtime_state=None):
+    tokens = _extract_clob_token_ids_from_obj(pos)
+    if tokens:
+        return tokens
+
+    lock = None
+    if runtime_state is not None:
+        lock = _get_live_market_lock(runtime_state, market_id=pos.get("market_id"), question=pos.get("question"))
+        if lock:
+            lock_tokens = lock.get("clob_token_ids")
+            if isinstance(lock_tokens, list) and lock_tokens:
+                return lock_tokens
+
+    market_id = pos.get("market_id")
+    if market_id:
+        details = get_market_details(market_id)
+        tokens = _extract_clob_token_ids_from_obj(details)
+        if tokens:
+            return tokens
+
+    # Last-resort lookup in current fast markets universe
+    qnorm = (pos.get("question") or "").strip().lower()
+    try:
+        for m in discover_fast_market_markets(ASSET, WINDOW):
+            mq = (m.get("question") or "").strip().lower()
+            if (market_id and m.get("market_id") == market_id) or (qnorm and mq == qnorm):
+                tokens = m.get("clob_token_ids")
+                if isinstance(tokens, list) and tokens:
+                    return tokens
+    except Exception:
+        pass
+    return None
+
+
+def _best_live_entry_price(pos, runtime_state=None):
+    for key in ("entry_price", "avg_fill", "fill_price"):
+        try:
+            value = float(pos.get(key, 0) or 0)
+            if 0 < value < 1:
+                return value
+        except Exception:
+            pass
+    shares_yes = float(pos.get("shares_yes", 0) or 0)
+    shares_no = float(pos.get("shares_no", 0) or 0)
+    shares = shares_yes if shares_yes > 0 else shares_no
+    entry_cost = _best_live_entry_cost(pos, runtime_state)
+    try:
+        if shares > 0 and entry_cost > 0:
+            implied = entry_cost / shares
+            if 0 < implied < 1:
+                return implied
+    except Exception:
+        pass
+    if runtime_state is not None:
+        lock = _get_live_market_lock(runtime_state, market_id=pos.get("market_id"), question=pos.get("question"))
+        if lock:
+            try:
+                value = float(lock.get("entry_price", 0) or 0)
+                if 0 < value < 1:
+                    return value
+            except Exception:
+                pass
+    return 0.0
+
+
+def _get_live_current_side_price(pos, side, runtime_state=None):
+    """Best-effort executable side price for exits.
+
+    Prefer the side-token best bid (what you can actually hit when selling).
+    Fall back to midpoint-derived side price if needed.
+    """
+    clob_token_ids = _get_position_clob_token_ids(pos, runtime_state)
+    book = fetch_side_orderbook_summary(clob_token_ids, side=side) if clob_token_ids else None
+    if book:
+        best_bid = book.get("best_bid")
+        if best_bid is not None:
+            return float(best_bid), "best_bid"
+        mid = book.get("mid")
+        if mid is not None:
+            return float(mid), "side_mid"
+
+    if clob_token_ids:
+        yes_mid = fetch_live_prices(clob_token_ids)
+        if yes_mid is not None:
+            current_price = yes_mid if side == "yes" else (1 - yes_mid)
+            return float(current_price), "yes_mid_derived"
+
+    try:
+        current_value = float(pos.get("current_value", 0) or 0)
+        shares = _position_shares_for_side(pos, side)
+        if shares > 0 and current_value > 0:
+            implied = current_value / shares
+            if 0 < implied < 1:
+                return implied, "portfolio_implied"
+    except Exception:
+        pass
+
+    return None, "unavailable"
 
 
 # =============================================================================
@@ -1910,6 +2130,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 shares=shares,
                 entry_price=display_fill_price,
                 entry_time=datetime.now(timezone.utc).isoformat(),
+                clob_token_ids=best.get("clob_token_ids"),
             )
             _append_live_trade_event(__file__, {
                 "type": "entry",
