@@ -101,6 +101,7 @@ CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
 LIVE_SCAN_INTERVAL_SECONDS = 15  # faster loop while running in live mode
+FOCUSED_LIVE_SCAN_INTERVAL_SECONDS = 5  # tighter management cadence while a live position/lock is active
 HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 _last_heartbeat_ts = 0
@@ -422,6 +423,27 @@ def _live_market_lock_active(state, market_id=None, question=None):
 def _current_live_locked_exposure(state):
     return round(sum(float(lock.get("entry_cost", 0.0) or 0.0) for lock in state.get("market_locks", [])), 6)
 
+def _has_active_live_market_lock(skill_file):
+    state = _prune_live_runtime_state(skill_file)
+    return any(not lock.get("closed") for lock in state.get("market_locks", []))
+
+
+def _active_live_position_count(runtime_state=None):
+    positions = get_positions()
+    count = 0
+    for pos in positions or []:
+        question = pos.get("question", "") or ""
+        if "up or down" not in question.lower():
+            continue
+        side = _position_side_from_dict(pos)
+        if side not in ("yes", "no"):
+            continue
+        shares = _position_shares_for_side(pos, side, runtime_state=runtime_state, use_lock_floor=False)
+        if shares > 0:
+            count += 1
+    return count
+
+
 
 def _register_live_market_lock(skill_file, market_id, question, end_time, entry_cost, side, shares=None, entry_price=None, entry_time=None, clob_token_ids=None):
     state = _prune_live_runtime_state(skill_file)
@@ -548,12 +570,12 @@ def _position_side_from_dict(pos):
 
 
 def _position_shares_for_side(pos, side, current_price=None, runtime_state=None, use_lock_floor=False):
-    """Best-effort held-share extraction for a live position.
+    """Conservative held-share extraction for a live position.
 
-    Some venue/portfolio payloads under-report side shares on fast markets. To
-    avoid underselling, combine direct side-share fields with inferred share
-    counts from current value / entry cost, and optionally use the live lock as
-    a floor while the trade is still open.
+    For live exits, do NOT infer shares from current value or entry cost. Only trust:
+      1) side-specific position share fields returned by Simmer
+      2) generic share/size fields when the payload explicitly says this side
+      3) the stored market lock shares as a floor while the position remains open
     """
     candidates = []
 
@@ -578,24 +600,6 @@ def _position_shares_for_side(pos, side, current_price=None, runtime_state=None,
     if declared_side == side:
         for key in ("shares", "quantity", "size", "position_size"):
             _add_candidate(pos.get(key))
-
-    # Infer from current marked value and current side price
-    try:
-        cp = float(current_price or 0)
-        current_value = float(pos.get("current_value", 0) or pos.get("market_value", 0) or pos.get("position_value", 0) or 0)
-        if cp > 0 and current_value > 0:
-            _add_candidate(current_value / cp)
-    except Exception:
-        pass
-
-    # Infer from entry cost and entry price
-    try:
-        entry_cost = _best_live_entry_cost(pos, runtime_state)
-        entry_price = _best_live_entry_price(pos, runtime_state)
-        if entry_cost > 0 and entry_price > 0:
-            _add_candidate(entry_cost / entry_price)
-    except Exception:
-        pass
 
     # While a live trade is open, trust the lock as a floor more than a possibly
     # under-reported portfolio share count. We release this floor once a sell
@@ -1852,6 +1856,16 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     paper_state, closed_paper_positions = manage_paper_positions(__file__, log)
     live_runtime_state, closed_live_positions = manage_live_positions(__file__, log) if not dry_run else (live_runtime_state, [])
 
+    # In single-position live mode, once we have an active live lock or open live
+    # position, stop scanning for new entries and focus only on that trade.
+    if not dry_run and SINGLE_POSITION_LIVE_MODE:
+        live_runtime_state = _prune_live_runtime_state(__file__, live_runtime_state)
+        active_locks = sum(1 for lock in live_runtime_state.get("market_locks", []) if not lock.get("closed"))
+        active_positions = _active_live_position_count(runtime_state=live_runtime_state)
+        if active_locks > 0 or active_positions > 0:
+            log(f"🎯 Position-focus mode: {max(active_locks, active_positions)} active live position/lock(s); skipping new entry scan.")
+            return
+
     guard_state, pause_remaining = _guard_pause_remaining(__file__)
     if pause_remaining > 0:
         log(f"\n⏸️  Loss-stop pause active for another {pause_remaining}s (reason: {guard_state.get('reason','loss_stop')}).", force=True)
@@ -2392,7 +2406,10 @@ if __name__ == "__main__":
             _last_heartbeat_ts = now_ts
             print(f"💓 Heartbeat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} | bot alive | monitoring for entry/exit")
 
-        sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS if args.live else SCAN_INTERVAL_SECONDS
+        if args.live and _has_active_live_market_lock(__file__):
+            sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
+        else:
+            sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS if args.live else SCAN_INTERVAL_SECONDS
         if not ACTION_ONLY_LOGS:
             print(f"\n⏳ Waiting {sleep_seconds} seconds before next scan...\n")
         time.sleep(sleep_seconds)
