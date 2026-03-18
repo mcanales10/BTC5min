@@ -2191,14 +2191,14 @@ if __name__ == "__main__":
                         "skip_reason": "no_signal",
                     }
                 }), flush=True)
+            _automaton_reported = False  # Reset for next cycle
 
         except Exception as e:
             print(f"❌ LOOP ERROR (cycle #{cycle_count}): {e}", flush=True)
             import traceback
             traceback.print_exc()
 
-        # Heartbeat
-        global _last_heartbeat_ts
+        # Heartbeat - no global needed, _last_heartbeat_ts is module level
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
