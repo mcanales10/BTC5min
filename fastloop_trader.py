@@ -1727,7 +1727,199 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"🔴 Live loss limit reached (${live_pnl_24h:.2f}). Pausing.")
             return
 
-    # =========================================================================
+   # =========================================================================
     # STEP 1: Discover markets
     # =========================================================================
-    log(f"\n🔍 Discovering
+    log(f"\n🔍 Discovering {ASSET} fast markets...")
+    markets = discover_fast_market_markets(ASSET, WINDOW)
+    log(f"  Found {len(markets)} active fast markets")
+
+    if not markets:
+        log("  No active fast markets found - may be outside market hours")
+        return
+
+    # Look up fee rate from sample token
+    sample = next((m for m in markets if m.get("clob_token_ids")), None)
+    if sample and sample.get("fee_rate_bps", 0) == 0:
+        fee = _lookup_fee_rate(sample["clob_token_ids"][0])
+        if fee > 0:
+            log(f"  Fee rate: {fee} bps ({fee/100:.0f}%)")
+            for m in markets:
+                m["fee_rate_bps"] = fee
+
+    # =========================================================================
+    # STEP 2: Find best market to trade
+    # =========================================================================
+    best = find_best_fast_market(markets)
+    if not best:
+        now = datetime.now(timezone.utc)
+        for m in markets:
+            if m.get("is_live_now") is False:
+                log(f"  Skipped: {m['question'][:50]}... (not live yet)")
+            elif m.get("end_time"):
+                secs = (m["end_time"] - now).total_seconds()
+                log(f"  Skipped: {m['question'][:50]}... ({secs:.0f}s left < {MIN_TIME_REMAINING}s min)")
+        log(f"  No tradeable markets right now - waiting for next window")
+        return
+
+    end_time = best.get("end_time")
+    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+
+    log(f"\n🎯 Selected: {best['question']}")
+    log(f"  Expires in: {remaining:.0f}s")
+    log(f"  Source: {best.get('source', 'unknown')}")
+    log(f"  Market ID: {best.get('market_id', 'none')}")
+
+    # Check cooldown
+    cooldowns = _load_bad_markets(__file__)
+    if _cooldown_is_active(cooldowns, best):
+        log(f"  Market on cooldown - skip")
+        return
+
+    # =========================================================================
+    # STEP 3: Fetch live CLOB price
+    # =========================================================================
+    clob_tokens = best.get("clob_token_ids", [])
+    log(f"\n  Fetching live CLOB price...")
+    log(f"  CLOB tokens: {clob_tokens}")
+
+    live_price = fetch_live_prices(clob_tokens) if clob_tokens else None
+
+    if live_price is None:
+        log(f"  Cannot fetch live CLOB price - skipping (unsafe for fast markets)")
+        _set_market_cooldown(__file__, best)
+        return
+
+    market_yes_price = live_price
+    log(f"  Current YES price: ${market_yes_price:.3f} (live CLOB)")
+
+    # =========================================================================
+    # STEP 4: Get CEX momentum signal
+    # =========================================================================
+    log(f"\n  Fetching {ASSET} momentum from Coinbase...")
+    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+
+    if not momentum:
+        log(f"  Failed to fetch price data from Coinbase")
+        return
+
+    # =========================================================================
+    # STEP 5: Find trade signal (mean reversion logic)
+    # =========================================================================
+    log(f"\n  Analyzing CEX/CLOB divergence...")
+    side, divergence, skip_reason = _find_trade_signal(momentum, market_yes_price, remaining)
+
+    if side is None:
+        log(f"  No signal: {skip_reason}")
+        return
+
+    log(f"  Signal found: {side.upper()} | divergence: {divergence:.3f}")
+
+    # Check minimum momentum
+    momentum_pct = abs(momentum["momentum_pct"])
+    if momentum_pct < MIN_MOMENTUM_PCT:
+        log(f"  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% - skip")
+        return
+
+    # Check spread
+    pre_spread = best.get("spread_cents")
+    book = None
+
+    if pre_spread is not None:
+        mid_estimate = market_yes_price if market_yes_price > 0 else 0.5
+        spread_pct = (pre_spread / 100.0) / mid_estimate
+        log(f"  Spread: {pre_spread:.1f} cents ({best.get('liquidity_tier', 'unknown')})")
+        if spread_pct > MAX_SPREAD_PCT:
+            log(f"  Spread {spread_pct:.1%} > max {MAX_SPREAD_PCT:.1%} - skip")
+            return
+    else:
+        book = fetch_orderbook_summary(clob_tokens) if clob_tokens else None
+        if book:
+            log(f"  Spread: {book['spread_pct']:.1%} "
+                f"(bid ${book['best_bid']:.3f} / ask ${book['best_ask']:.3f})")
+            log(f"  Depth: ${book['bid_depth_usd']:.0f} bid / ${book['ask_depth_usd']:.0f} ask")
+            if book["spread_pct"] > MAX_SPREAD_PCT:
+                log(f"  Spread too wide - skip")
+                _set_market_cooldown(__file__, best)
+                return
+        else:
+            log(f"  Could not fetch order book - skip")
+            _set_market_cooldown(__file__, best)
+            return
+
+    # Entry price calculation
+    buy_price_mid = market_yes_price if side == "yes" else (1.0 - market_yes_price)
+    effective_fee_rate = POLY_FEE_RATE * (buy_price_mid * (1 - buy_price_mid)) ** POLY_FEE_EXPONENT
+    fee_per_share = buy_price_mid * effective_fee_rate
+    min_divergence = fee_per_share * 2 + ENTRY_THRESHOLD
+
+    # Get side-specific book for slippage
+    side_book = fetch_side_orderbook_summary(clob_tokens, side=side) if clob_tokens else None
+    price = buy_price_mid
+    if side_book and side_book.get("best_ask") is not None:
+        price = float(side_book["best_ask"] or price)
+
+    # Entry price guards
+    if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
+        log(f"  Entry price ${price:.3f} outside allowed range - skip")
+        return
+
+    if not dry_run and price < MIN_LIVE_ENTRY_PRICE:
+        log(f"  Live entry price ${price:.3f} below minimum ${MIN_LIVE_ENTRY_PRICE:.2f} - skip")
+        return
+
+    if price >= MOMENTUM_MAX_ENTRY:
+        log(f"  Entry price ${price:.3f} >= max allowed ${MOMENTUM_MAX_ENTRY:.2f} - skip")
+        return
+
+    # Multi-factor score
+    score, score_details = _score_entry_setup(
+        side=side,
+        momentum=momentum,
+        divergence=divergence,
+        min_divergence=min_divergence,
+        seconds_left=remaining,
+        yes_book=book,
+        side_book=side_book,
+        side_price=buy_price_mid,
+    )
+
+    log(f"\n  Entry Score: {score:.3f} / {ENTRY_SCORE_THRESHOLD:.3f} threshold")
+    log(f"  Score breakdown:")
+    log(f"    momentum:     {score_details['momentum']:.3f}")
+    log(f"    acceleration: {score_details['acceleration']:.3f}")
+    log(f"    spread:       {score_details['spread']:.3f}")
+    log(f"    volume:       {score_details['volume']:.3f}")
+    log(f"    imbalance:    {score_details['imbalance']:.3f}")
+    log(f"    time:         {score_details['time']:.3f}")
+    log(f"    edge:         {score_details['edge']:.3f}")
+    log(f"    slippage:     {score_details['slippage']:.3f}")
+
+    if score_details["edge"] <= 0:
+        log(f"  Edge too weak after fees - skip")
+        return
+
+    if score < ENTRY_SCORE_THRESHOLD:
+        log(f"  Score {score:.3f} below threshold {ENTRY_SCORE_THRESHOLD:.3f} - skip")
+        return
+
+    # =========================================================================
+    # STEP 6: Position sizing and exposure check
+    # =========================================================================
+    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
+
+    if dry_run:
+        current_open_exposure = sum(
+            float(p.get("entry_cost", 0)) for p in paper_state.get("open_positions", [])
+        )
+    else:
+        live_positions = get_positions()
+        positions_exposure, _ = _estimate_live_open_exposure(live_positions)
+        current_open_exposure = positions_exposure
+
+    remaining_exposure = MAX_OPEN_EXPOSURE - current_open_exposure
+    if remaining_exposure <= 0:
+        log(f"  Exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) - skip")
+        return
+
+    if position_size > remaining_e
