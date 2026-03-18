@@ -639,6 +639,13 @@ def manage_live_positions(skill_file, log):
     closed = []
     now = datetime.now(timezone.utc)
 
+    def _round_down_shares(value, decimals=4):
+        try:
+            factor = 10 ** decimals
+            return math.floor(float(value) * factor) / factor
+        except Exception:
+            return 0.0
+
     for pos in positions:
         question = pos.get("question", "") or ""
         if "up or down" not in question.lower():
@@ -646,11 +653,18 @@ def manage_live_positions(skill_file, log):
         side = _position_side_from_dict(pos)
         if side not in ("yes", "no"):
             continue
-        shares = _position_shares_for_side(pos, side)
-        if shares <= 0:
+
+        held_shares = float(_position_shares_for_side(pos, side) or 0.0)
+        if held_shares <= 0:
             continue
 
         lock = _get_live_market_lock(state, market_id=pos.get("market_id"), question=question)
+        lock_shares = float((lock or {}).get("shares") or 0.0)
+        shares = held_shares if lock_shares <= 0 else min(held_shares, lock_shares)
+        shares = _round_down_shares(shares)
+        if shares <= 0:
+            continue
+
         entry_cost = _best_live_entry_cost(pos, state)
         entry_price = _best_live_entry_price(pos, state)
         if entry_cost <= 0 or entry_price <= 0:
@@ -680,6 +694,15 @@ def manage_live_positions(skill_file, log):
             reason = "max_hold_exit"
 
         if not reason:
+            continue
+
+        exit_notional = shares * current_price
+        if exit_notional < 1.0:
+            log(
+                f"  ⏸️  Live exit deferred on {question[:45]}... "
+                f"({reason}, held {shares:.4f} {side.upper()} @ ${current_price:.3f}, value ${exit_notional:.2f} < $1 minimum)",
+                force=True,
+            )
             continue
 
         result = execute_trade(pos.get("market_id"), side, shares=shares, action="sell")
@@ -718,14 +741,63 @@ def manage_live_positions(skill_file, log):
                 "reason": reason,
                 "estimated_pnl": round(realized, 6),
             })
-        else:
-            err = result.get("error", "Unknown error") if result else "No response"
-            log(
-                f"  ❌ Live sell failed on {question[:45]}... "
-                f"({reason}, entry ${entry_price:.3f}, now ${current_price:.3f} via {price_source}, "
-                f"TP ${target_price:.3f}, SL ${stop_price:.3f}): {err}",
-                force=True,
-            )
+            continue
+
+        err = result.get("error", "Unknown error") if result else "No response"
+
+        if "Insufficient shares" in str(err):
+            refreshed = _find_live_position(market_id=pos.get("market_id"), question=question, side=side)
+            refreshed_held = float(_position_shares_for_side(refreshed or {}, side) or 0.0)
+            retry_shares = refreshed_held if lock_shares <= 0 else min(refreshed_held, lock_shares)
+            retry_shares = _round_down_shares(retry_shares)
+            retry_notional = retry_shares * current_price
+            if retry_shares > 0 and retry_shares < shares and retry_notional >= 1.0:
+                retry = execute_trade(pos.get("market_id"), side, shares=retry_shares, action="sell")
+                if retry and retry.get("success"):
+                    proceeds = float(retry.get("cost") or 0.0)
+                    avg_exit = (proceeds / retry_shares) if retry_shares > 0 and proceeds > 0 else current_price
+                    realized = retry_shares * ((avg_exit or current_price) - entry_price)
+                    log(
+                        f"  ✅ Sold {retry_shares:.2f} {side.upper()} shares @ ${(avg_exit or current_price):.3f} "
+                        f"({reason}, retry after share refresh, est P&L ${realized:.2f})",
+                        force=True,
+                    )
+                    _mark_live_market_lock_closed(skill_file, market_id=pos.get("market_id"), question=question)
+                    _append_live_trade_event(skill_file, {
+                        "type": "exit",
+                        "market_id": pos.get("market_id"),
+                        "question": question,
+                        "side": side,
+                        "shares": retry_shares,
+                        "entry_cost": round(entry_cost, 6),
+                        "entry_price": round(entry_price, 6),
+                        "trigger_price": round(current_price, 6),
+                        "trigger_source": price_source,
+                        "target_price": round(target_price, 6),
+                        "stop_price": round(stop_price, 6),
+                        "exit_value": round(proceeds, 6),
+                        "avg_exit": round(avg_exit, 6) if avg_exit else None,
+                        "reason": reason,
+                        "estimated_pnl": round(realized, 6),
+                    })
+                    closed.append({
+                        "market_id": pos.get("market_id"),
+                        "question": question,
+                        "side": side,
+                        "shares": retry_shares,
+                        "reason": reason,
+                        "estimated_pnl": round(realized, 6),
+                    })
+                    continue
+                else:
+                    err = retry.get("error", err) if retry else err
+
+        log(
+            f"  ❌ Live sell failed on {question[:45]}... "
+            f"({reason}, held {shares:.4f} {side.upper()}, entry ${entry_price:.3f}, now ${current_price:.3f} via {price_source}, "
+            f"TP ${target_price:.3f}, SL ${stop_price:.3f}): {err}",
+            force=True,
+        )
 
     return _prune_live_runtime_state(skill_file), closed
 
