@@ -547,12 +547,65 @@ def _position_side_from_dict(pos):
     return None
 
 
-def _position_shares_for_side(pos, side):
+def _position_shares_for_side(pos, side, current_price=None, runtime_state=None, use_lock_floor=False):
+    """Best-effort held-share extraction for a live position.
+
+    Some venue/portfolio payloads under-report side shares on fast markets. To
+    avoid underselling, combine direct side-share fields with inferred share
+    counts from current value / entry cost, and optionally use the live lock as
+    a floor while the trade is still open.
+    """
+    candidates = []
+
+    def _add_candidate(value):
+        try:
+            value = float(value or 0)
+            if value > 0:
+                candidates.append(value)
+        except Exception:
+            pass
+
+    # Side-specific raw fields
     if side == "yes":
-        return float(pos.get("shares_yes", 0) or 0)
-    if side == "no":
-        return float(pos.get("shares_no", 0) or 0)
-    return 0.0
+        _add_candidate(pos.get("shares_yes"))
+        _add_candidate(pos.get("yes_shares"))
+    elif side == "no":
+        _add_candidate(pos.get("shares_no"))
+        _add_candidate(pos.get("no_shares"))
+
+    # Generic share fields only when they clearly refer to this side
+    declared_side = str(pos.get("side") or "").strip().lower()
+    if declared_side == side:
+        for key in ("shares", "quantity", "size", "position_size"):
+            _add_candidate(pos.get(key))
+
+    # Infer from current marked value and current side price
+    try:
+        cp = float(current_price or 0)
+        current_value = float(pos.get("current_value", 0) or pos.get("market_value", 0) or pos.get("position_value", 0) or 0)
+        if cp > 0 and current_value > 0:
+            _add_candidate(current_value / cp)
+    except Exception:
+        pass
+
+    # Infer from entry cost and entry price
+    try:
+        entry_cost = _best_live_entry_cost(pos, runtime_state)
+        entry_price = _best_live_entry_price(pos, runtime_state)
+        if entry_cost > 0 and entry_price > 0:
+            _add_candidate(entry_cost / entry_price)
+    except Exception:
+        pass
+
+    # While a live trade is open, trust the lock as a floor more than a possibly
+    # under-reported portfolio share count. We release this floor once a sell
+    # succeeds and the lock is marked closed.
+    if use_lock_floor and runtime_state is not None:
+        lock = _get_live_market_lock(runtime_state, market_id=pos.get("market_id"), question=pos.get("question"))
+        if lock and not lock.get("closed"):
+            _add_candidate(lock.get("shares"))
+
+    return max(candidates) if candidates else 0.0
 
 
 def _get_live_market_lock(state, market_id=None, question=None):
@@ -654,16 +707,7 @@ def manage_live_positions(skill_file, log):
         if side not in ("yes", "no"):
             continue
 
-        held_shares = float(_position_shares_for_side(pos, side) or 0.0)
-        if held_shares <= 0:
-            continue
-
         lock = _get_live_market_lock(state, market_id=pos.get("market_id"), question=question)
-        lock_shares = float((lock or {}).get("shares") or 0.0)
-        shares = held_shares if lock_shares <= 0 else min(held_shares, lock_shares)
-        shares = _round_down_shares(shares)
-        if shares <= 0:
-            continue
 
         entry_cost = _best_live_entry_cost(pos, state)
         entry_price = _best_live_entry_price(pos, state)
@@ -672,6 +716,17 @@ def manage_live_positions(skill_file, log):
 
         current_price, price_source = _get_live_current_side_price(pos, side, state)
         if current_price is None:
+            continue
+
+        held_shares = float(_position_shares_for_side(
+            pos,
+            side,
+            current_price=current_price,
+            runtime_state=state,
+            use_lock_floor=True,
+        ) or 0.0)
+        shares = _round_down_shares(held_shares)
+        if shares <= 0:
             continue
 
         end_time = _position_end_time(pos)
@@ -747,9 +802,14 @@ def manage_live_positions(skill_file, log):
 
         if "Insufficient shares" in str(err):
             refreshed = _find_live_position(market_id=pos.get("market_id"), question=question, side=side)
-            refreshed_held = float(_position_shares_for_side(refreshed or {}, side) or 0.0)
-            retry_shares = refreshed_held if lock_shares <= 0 else min(refreshed_held, lock_shares)
-            retry_shares = _round_down_shares(retry_shares)
+            refreshed_held = float(_position_shares_for_side(
+                refreshed or {},
+                side,
+                current_price=current_price,
+                runtime_state=state,
+                use_lock_floor=False,
+            ) or 0.0)
+            retry_shares = _round_down_shares(refreshed_held)
             retry_notional = retry_shares * current_price
             if retry_shares > 0 and retry_shares < shares and retry_notional >= 1.0:
                 retry = execute_trade(pos.get("market_id"), side, shares=retry_shares, action="sell")
