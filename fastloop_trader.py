@@ -1903,7 +1903,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Score {score:.3f} below threshold {ENTRY_SCORE_THRESHOLD:.3f} - skip")
         return
 
-    # =========================================================================
+     # =========================================================================
     # STEP 6: Position sizing and exposure check
     # =========================================================================
     position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
@@ -1922,4 +1922,307 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) - skip")
         return
 
-    if position_size > remaining_e
+    if position_size > remaining_exposure:
+        position_size = remaining_exposure
+        log(f"  Position capped at ${position_size:.2f} (exposure limit)")
+
+    if position_size < 0.50:
+        log(f"  Position ${position_size:.2f} too small - skip")
+        return
+
+    # Minimum shares check
+    if price > 0:
+        min_cost = MIN_SHARES_PER_ORDER * price
+        if min_cost > position_size:
+            log(f"  Position ${position_size:.2f} too small for "
+                f"{MIN_SHARES_PER_ORDER} shares at ${price:.3f} - skip")
+            return
+
+    # =========================================================================
+    # STEP 7: Signal confirmed - log it
+    # =========================================================================
+    trade_rationale = (
+        f"BTC {momentum['momentum_pct']:+.3f}% | "
+        f"implied YES ${0.50 + (momentum['momentum_pct']/100.0)*15:.3f} | "
+        f"actual YES ${market_yes_price:.3f} | "
+        f"divergence {divergence:.3f}"
+    )
+
+    log(f"\n{'='*50}")
+    log(f"✅ TRADE SIGNAL: {side.upper()}")
+    log(f"   Rationale: {trade_rationale}")
+    log(f"   Entry price: ${price:.3f}")
+    log(f"   Position size: ${position_size:.2f}")
+    log(f"   Score: {score:.3f}")
+    log(f"   TP: ${round(price * (1 + TAKE_PROFIT_PCT), 3):.3f} | "
+        f"SL: ${round(max(0.001, price * (1 - STOP_LOSS_PCT)), 3):.3f}")
+    log(f"{'='*50}")
+
+    # =========================================================================
+    # STEP 8: Get market ID (already have from Simmer, or import from Gamma)
+    # =========================================================================
+    if best.get("market_id"):
+        market_id = best["market_id"]
+        log(f"\n  Market ready: {market_id}")
+    else:
+        log(f"\n  Importing market to Simmer...")
+        market_id, import_error = import_fast_market_market(best["slug"])
+        if not market_id:
+            log(f"  Import failed: {import_error}")
+            return
+        log(f"  Market imported: {market_id}")
+
+    # =========================================================================
+    # STEP 9: Execute trade
+    # =========================================================================
+    tag = "PAPER" if dry_run else "LIVE"
+    log(f"\n  Executing {side.upper()} {tag} trade for ${position_size:.2f}...")
+
+    result = execute_trade(market_id, side, amount=position_size, action="buy")
+
+    if result and result.get("success"):
+        # Get shares from trade result - most reliable source
+        shares = float(result.get("shares_bought") or result.get("shares") or 0)
+        actual_cost = float(result.get("cost") or position_size)
+        trade_id = result.get("trade_id")
+
+        # Derive actual fill price from cost/shares
+        if shares > 0 and actual_cost > 0:
+            fill_price = actual_cost / shares
+        else:
+            fill_price = price
+
+        log(f"\n{'='*50}")
+        if result.get("simulated"):
+            log(f"✅ [PAPER] TRADE EXECUTED")
+        else:
+            log(f"✅ [LIVE] TRADE EXECUTED")
+        log(f"   Side:       {side.upper()}")
+        log(f"   Shares:     {shares:.4f}")
+        log(f"   Fill price: ${fill_price:.4f}")
+        log(f"   Cost:       ${actual_cost:.4f}")
+        log(f"   Trade ID:   {trade_id}")
+        log(f"{'='*50}")
+
+        if result.get("simulated"):
+            # Paper trade tracking
+            target_price = round(fill_price * (1 + TAKE_PROFIT_PCT), 6)
+            stop_price_val = round(max(0.001, fill_price * (1 - STOP_LOSS_PCT)), 6)
+
+            paper_state["spent"] = round(float(paper_state.get("spent", 0.0)) + actual_cost, 6)
+            paper_state["trades"] = int(paper_state.get("trades", 0)) + 1
+            paper_state.setdefault("open_positions", []).append({
+                "market_id": market_id,
+                "question": best.get("question", ""),
+                "side": side,
+                "shares": round(shares, 6),
+                "entry_price": round(fill_price, 6),
+                "entry_cost": round(actual_cost, 6),
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "end_time": end_time.isoformat() if end_time else None,
+                "clob_token_ids": clob_tokens,
+                "target_price": target_price,
+                "stop_price": stop_price_val,
+                "entry_fee_per_share": round(_estimate_fee_per_share(fill_price), 8),
+            })
+            _save_paper_state(__file__, paper_state)
+            log(f"  [PAPER] TP ${target_price:.3f} / SL ${stop_price_val:.3f} tracking active")
+
+        else:
+            # LIVE trade - save entry record immediately
+            _save_entry_record(
+                __file__,
+                market_id=market_id,
+                question=best.get("question", ""),
+                side=side,
+                entry_price=fill_price,
+                shares=shares,
+                entry_cost=actual_cost,
+                end_time=end_time,
+                clob_token_ids=clob_tokens,
+            )
+
+            # Update daily spend
+            live_spend["spent"] = round(live_spend.get("spent", 0.0) + actual_cost, 6)
+            live_spend["trades"] = int(live_spend.get("trades", 0)) + 1
+            _save_daily_spend(__file__, live_spend)
+
+            # Append to trade ledger
+            _append_live_trade_event(__file__, {
+                "type": "entry",
+                "market_id": market_id,
+                "question": best.get("question", ""),
+                "side": side,
+                "quoted_price": round(price, 6),
+                "fill_price": round(fill_price, 6),
+                "shares": round(shares, 6),
+                "entry_cost": round(actual_cost, 6),
+                "momentum_pct": round(momentum["momentum_pct"], 6),
+                "volume_ratio": round(momentum["volume_ratio"], 6),
+                "divergence": round(divergence, 6),
+                "score": round(score, 6),
+            })
+
+            # Log to trade journal if available
+            if trade_id and JOURNAL_AVAILABLE:
+                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                log_trade(
+                    trade_id=trade_id,
+                    source=TRADE_SOURCE,
+                    skill_slug=SKILL_SLUG,
+                    thesis=trade_rationale,
+                    confidence=round(confidence, 2),
+                    asset=ASSET,
+                    momentum_pct=round(momentum["momentum_pct"], 3),
+                    volume_ratio=round(momentum["volume_ratio"], 2),
+                    signal_source=SIGNAL_SOURCE,
+                )
+
+    else:
+        error = result.get("error", "Unknown error") if result else "No response"
+        log(f"\n❌ TRADE FAILED: {error}")
+
+        if os.environ.get("AUTOMATON_MANAGED"):
+            report = {
+                "signals": 1,
+                "trades_attempted": 1,
+                "trades_executed": 0,
+                "execution_errors": [error[:120]],
+            }
+            print(json.dumps({"automaton": report}), flush=True)
+            global _automaton_reported
+            _automaton_reported = True
+        return
+
+    # Automaton report on success
+    if os.environ.get("AUTOMATON_MANAGED"):
+        total_trades = 1 if result and result.get("success") else 0
+        amount = round(position_size, 2) if total_trades > 0 else 0
+        report = {
+            "signals": 1,
+            "trades_attempted": 1,
+            "trades_executed": total_trades,
+            "amount_usd": amount,
+        }
+        print(json.dumps({"automaton": report}), flush=True)
+        _automaton_reported = True
+
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "="*60, flush=True)
+    print("FASTLOOP v2.1 - MAIN ENTRY POINT", flush=True)
+    print(f"Time: {_safe_et_timestamp()}", flush=True)
+    print("="*60 + "\n", flush=True)
+
+    parser = argparse.ArgumentParser(description="Simmer FastLoop Trading Skill v2.1")
+    parser.add_argument("--live", action="store_true", help="Execute real trades")
+    parser.add_argument("--dry-run", action="store_true", help="Show opportunities without trading")
+    parser.add_argument("--positions", action="store_true", help="Show current positions")
+    parser.add_argument("--config", action="store_true", help="Show current config")
+    parser.add_argument("--set", action="append", metavar="KEY=VALUE", help="Update config")
+    parser.add_argument("--smart-sizing", action="store_true", help="Portfolio-based sizing")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Only output on trades/errors")
+
+    args = parser.parse_args()
+    print(f"Arguments: live={args.live} dry_run={args.dry_run} "
+          f"positions={args.positions} quiet={args.quiet}", flush=True)
+
+    # Handle --set config updates
+    if args.set:
+        updates = {}
+        for item in args.set:
+            if "=" not in item:
+                print(f"Invalid --set format: {item}. Use KEY=VALUE", flush=True)
+                sys.exit(1)
+            key, val = item.split("=", 1)
+            if key in CONFIG_SCHEMA:
+                type_fn = CONFIG_SCHEMA[key].get("type", str)
+                try:
+                    if type_fn == bool:
+                        updates[key] = val.lower() in ("true", "1", "yes")
+                    else:
+                        updates[key] = type_fn(val)
+                except ValueError:
+                    print(f"Invalid value for {key}: {val}", flush=True)
+                    sys.exit(1)
+            else:
+                print(f"Unknown config key: {key}", flush=True)
+                print(f"Valid keys: {', '.join(CONFIG_SCHEMA.keys())}", flush=True)
+                sys.exit(1)
+        update_config(updates, __file__)
+        print(f"✅ Config updated: {json.dumps(updates)}", flush=True)
+        sys.exit(0)
+
+    dry_run = not args.live
+
+    print(f"Mode: {'LIVE' if args.live else 'PAPER/DRY-RUN'}", flush=True)
+    print(f"Starting main loop...", flush=True)
+
+    cycle_count = 0
+
+    while True:
+        cycle_count += 1
+        print(f"\n{'='*60}", flush=True)
+        print(f"🔄 SCAN CYCLE #{cycle_count} | {_safe_et_timestamp()}", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        try:
+            _tick_market_cooldowns(__file__)
+
+            run_fast_market_strategy(
+                dry_run=dry_run,
+                positions_only=args.positions,
+                show_config=args.config,
+                smart_sizing=args.smart_sizing,
+                quiet=args.quiet,
+            )
+
+            # Automaton fallback report
+            if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
+                print(json.dumps({
+                    "automaton": {
+                        "signals": 0,
+                        "trades_attempted": 0,
+                        "trades_executed": 0,
+                        "skip_reason": "no_signal",
+                    }
+                }), flush=True)
+
+        except Exception as e:
+            print(f"❌ LOOP ERROR (cycle #{cycle_count}): {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+        # Heartbeat
+        global _last_heartbeat_ts
+        now_ts = time.time()
+        if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
+            _last_heartbeat_ts = now_ts
+            entry = _load_entry_record(__file__)
+            position_status = "NO POSITION"
+            if entry:
+                position_status = (
+                    f"ACTIVE: {entry['side'].upper()} @ ${entry['entry_price']:.3f} | "
+                    f"TP ${entry['target_price']:.3f} | SL ${entry['stop_price']:.3f}"
+                )
+            print(f"\n❤️  HEARTBEAT | {_safe_et_timestamp()} | "
+                  f"Cycle #{cycle_count} | {position_status}", flush=True)
+
+        # Sleep interval
+        entry_active = _has_active_entry_record(__file__)
+        if not dry_run and entry_active:
+            sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS  # 3 seconds
+            print(f"  Position active - next check in {sleep_seconds}s", flush=True)
+        elif args.live:
+            sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS  # 15 seconds
+            print(f"  Next scan in {sleep_seconds}s", flush=True)
+        else:
+            sleep_seconds = SCAN_INTERVAL_SECONDS  # 30 seconds
+            print(f"  Next scan in {sleep_seconds}s", flush=True)
+
+        time.sleep(sleep_seconds)
+```
