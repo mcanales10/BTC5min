@@ -26,6 +26,13 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
 
+def _safe_et_timestamp():
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).strftime('%Y-%m-%d %I:%M:%S %p ET')
+    except Exception:
+        return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
+
+
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -2417,7 +2424,7 @@ if __name__ == "__main__":
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
-            print(f"💓 Heartbeat {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %I:%M:%S %p ET')} | bot alive | monitoring for entry/exit")
+            print(f"💓 Heartbeat {_safe_et_timestamp()} | bot alive | monitoring for entry/exit")
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
