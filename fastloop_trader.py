@@ -2225,4 +2225,3 @@ if __name__ == "__main__":
             print(f"  Next scan in {sleep_seconds}s", flush=True)
 
         time.sleep(sleep_seconds)
-```
