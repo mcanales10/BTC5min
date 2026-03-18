@@ -2417,7 +2417,7 @@ if __name__ == "__main__":
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
-            print(f"💓 Heartbeat {datetime.now(ZoneInfo("America/New_York")).strftime('%Y-%m-%d %I:%M:%S %p ET')} | bot alive | monitoring for entry/exit")
+            print(f"💓 Heartbeat {datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %I:%M:%S %p ET')} | bot alive | monitoring for entry/exit")
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
