@@ -58,6 +58,8 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
+    "entry_score_threshold": {"default": 0.62, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
+                         "help": "Minimum multi-factor entry score required to trade (0-1)"},
     "max_position": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
     "signal_source": {"default": "binance", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
@@ -140,6 +142,7 @@ from simmer_sdk.skill import load_config, update_config, get_config_path
 cfg = load_config(CONFIG_SCHEMA, __file__, slug="polymarket-fast-loop")
 ENTRY_THRESHOLD = cfg["entry_threshold"]
 MIN_MOMENTUM_PCT = cfg["min_momentum_pct"]
+ENTRY_SCORE_THRESHOLD = cfg["entry_score_threshold"]
 MAX_POSITION_USD = cfg["max_position"]
 _automaton_max = os.environ.get("AUTOMATON_MAX_BET")
 if _automaton_max:
@@ -1620,6 +1623,18 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
 
         momentum_pct = ((price_now - price_then) / price_then) * 100
         direction = "up" if momentum_pct > 0 else "down"
+        recent_pct = 0.0
+        prior_pct = 0.0
+        if len(candles) >= 2:
+            prev_close = float(candles[1][4])
+            if prev_close > 0:
+                recent_pct = ((price_now - prev_close) / prev_close) * 100
+        if len(candles) >= 3:
+            prior_close = float(candles[2][4])
+            prev_close = float(candles[1][4])
+            if prior_close > 0:
+                prior_pct = ((prev_close - prior_close) / prior_close) * 100
+        acceleration_pct = recent_pct - prior_pct
 
         volumes = [float(c[5]) for c in candles]
         avg_volume = sum(volumes) / len(volumes)
@@ -1628,6 +1643,8 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
 
         return {
             "momentum_pct": momentum_pct,
+            "recent_momentum_pct": recent_pct,
+            "acceleration_pct": acceleration_pct,
             "direction": direction,
             "price_now": price_now,
             "price_then": price_then,
@@ -1655,6 +1672,88 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
         return None
     else:
         return None
+
+
+def _clamp01(value):
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
+
+
+def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left, yes_book=None, side_book=None, side_price=None):
+    """Multi-factor entry score for fast markets. Returns (score, details)."""
+    momentum_pct = abs(float(momentum.get("momentum_pct", 0.0) or 0.0))
+    recent_pct = abs(float(momentum.get("recent_momentum_pct", 0.0) or 0.0))
+    acceleration_pct = float(momentum.get("acceleration_pct", 0.0) or 0.0)
+    direction = str(momentum.get("direction") or "").lower()
+    volume_ratio = float(momentum.get("volume_ratio", 1.0) or 1.0)
+
+    spread_source = side_book or yes_book or {}
+    spread_pct = float(spread_source.get("spread_pct") or 0.0) if spread_source else 0.0
+
+    # Momentum strength prefers moves well above the floor.
+    momentum_score = _clamp01((momentum_pct - MIN_MOMENTUM_PCT) / max(0.0001, 0.30 - MIN_MOMENTUM_PCT))
+
+    # Recent acceleration: favor setups where the last minute agrees with and accelerates the move.
+    recent_aligned = 1.0 if ((direction == "up" and float(momentum.get("recent_momentum_pct", 0.0) or 0.0) > 0) or
+                              (direction == "down" and float(momentum.get("recent_momentum_pct", 0.0) or 0.0) < 0)) else 0.0
+    aligned_accel = acceleration_pct if direction == "up" else -acceleration_pct
+    acceleration_score = _clamp01(0.55 * _clamp01(recent_pct / 0.08) * recent_aligned + 0.45 * _clamp01(aligned_accel / 0.06))
+
+    spread_score = _clamp01(1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6)))
+    volume_score = _clamp01((volume_ratio - 0.40) / 1.60)
+
+    imbalance_score = 0.45
+    if side_book:
+        bid_depth = float(side_book.get("bid_depth_usd") or 0.0)
+        ask_depth = float(side_book.get("ask_depth_usd") or 0.0)
+        total_depth = bid_depth + ask_depth
+        if total_depth > 0:
+            bid_share = bid_depth / total_depth
+            imbalance_score = _clamp01((bid_share - 0.45) / 0.25)
+
+    time_score = _clamp01((float(seconds_left or 0.0) - float(MIN_TIME_REMAINING)) / max(1.0, 240.0 - float(MIN_TIME_REMAINING)))
+    edge_score = _clamp01((float(divergence) - float(min_divergence)) / 0.08)
+
+    slippage_score = 0.50
+    if side_book and side_price:
+        best_ask = side_book.get("best_ask")
+        try:
+            if best_ask is not None and side_price > 0:
+                slip_pct = max(0.0, (float(best_ask) - float(side_price)) / float(side_price))
+                slippage_score = _clamp01(1.0 - (slip_pct / 0.05))
+        except Exception:
+            pass
+
+    weights = {
+        "momentum": 0.20,
+        "acceleration": 0.10,
+        "spread": 0.15,
+        "volume": 0.10,
+        "imbalance": 0.15,
+        "time": 0.10,
+        "edge": 0.15,
+        "slippage": 0.05,
+    }
+    details = {
+        "momentum": round(momentum_score, 3),
+        "acceleration": round(acceleration_score, 3),
+        "spread": round(spread_score, 3),
+        "volume": round(volume_score, 3),
+        "imbalance": round(imbalance_score, 3),
+        "time": round(time_score, 3),
+        "edge": round(edge_score, 3),
+        "slippage": round(slippage_score, 3),
+    }
+    score = sum(weights[k] * details[k] for k in weights)
+    details["score"] = round(score, 3)
+    details["threshold"] = round(ENTRY_SCORE_THRESHOLD, 3)
+    details["spread_pct"] = round(spread_pct, 4)
+    details["volume_ratio"] = round(volume_ratio, 3)
+    details["divergence"] = round(float(divergence), 4)
+    details["min_divergence"] = round(float(min_divergence), 4)
+    return score, details
 
 
 # =============================================================================
@@ -1792,6 +1891,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Asset:            {ASSET}")
     log(f"  Window:           {WINDOW}")
     log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
+    log(f"  Entry score min:  {ENTRY_SCORE_THRESHOLD:.2f} (multi-factor score threshold)")
     log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
@@ -2108,53 +2208,26 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
         trade_rationale = f"{ASSET} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
 
-    # Volume confidence adjustment
-    vol_note = ""
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < (0.75 if not dry_run else 0.5):
-        log(f"  ⏸️  Low volume ({momentum['volume_ratio']:.2f}x avg) — weak signal, skip")
-        if not quiet and not ACTION_ONLY_LOGS:
-            print(f"📊 Summary: No trade (low volume)")
-        skip_reasons.append("low volume")
-        _emit_skip_report()
-        return
-    elif VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
-        vol_note = f" 📊 (high volume: {momentum['volume_ratio']:.1f}x avg)"
-
-    # Check divergence threshold
-    if divergence <= 0:
-        log(f"  ⏸️  Market already priced in: divergence {divergence:.3f} ≤ 0 — skip")
-        if not quiet and not ACTION_ONLY_LOGS:
-            print(f"📊 Summary: No trade (market already priced in)")
-        skip_reasons.append("market already priced in")
+    # Build a multi-factor entry score instead of relying on one gate.
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.15:
+        log(f"  ⏸️  Volume {momentum['volume_ratio']:.2f}x is too low for live quality — skip")
+        skip_reasons.append("extremely low volume")
         _emit_skip_report()
         return
 
-    # Fee-aware EV check: require enough divergence to cover fees
-    # EV = win_prob * payout_after_fees - (1 - win_prob) * cost
-    # At the buy price, win_prob ≈ buy_price (market-implied).
-    # We need our edge (divergence) to overcome the fee drag.
-    if fee_rate_bps > 0:
-        buy_price = market_yes_price if side == "yes" else (1 - market_yes_price)
-        # Polymarket crypto fee: fee = C × p × 0.25 × (p × (1-p))^2
-        # Effective rate = 0.25 × (p × (1-p))^2. Fee per share = buy_price × eff_rate.
-        effective_fee_rate = POLY_FEE_RATE * (buy_price * (1 - buy_price)) ** POLY_FEE_EXPONENT
-        fee_per_share = buy_price * effective_fee_rate  # absolute fee in price terms
-        # Divergence is in absolute price — compare to fee drag + buffer
-        min_divergence = fee_per_share * 2 + 0.02  # round-trip fee + buffer
-        log(f"  Fee:              ${fee_per_share:.4f}/share ({effective_fee_rate:.2%} effective, min divergence {min_divergence:.3f})")
-        if divergence < min_divergence:
-            log(f"  ⏸️  Divergence {divergence:.3f} < fee-adjusted minimum {min_divergence:.3f} — skip")
-            if not quiet and not ACTION_ONLY_LOGS:
-                print(f"📊 Summary: No trade (fees eat the edge)")
-            skip_reasons.append("fees eat the edge")
-            _emit_skip_report()
-            return
+    # Fee-aware edge floor used by the score model.
+    buy_price_mid = market_yes_price if side == "yes" else (1 - market_yes_price)
+    effective_fee_rate = POLY_FEE_RATE * (buy_price_mid * (1 - buy_price_mid)) ** POLY_FEE_EXPONENT
+    fee_per_share = buy_price_mid * effective_fee_rate
+    min_divergence = fee_per_share * 2 + 0.02
 
-    # We have a signal!
-    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
-    price = market_yes_price if side == "yes" else (1 - market_yes_price)
+    # Side-specific executable book for entry quality / slippage estimation.
+    side_book = fetch_side_orderbook_summary(clob_tokens, side=side) if clob_tokens else None
+    price = buy_price_mid
+    if side_book and side_book.get("best_ask") is not None:
+        price = float(side_book["best_ask"] or price)
 
-    # Entry price / strategy-mode filter
+    # Entry price / strategy-mode filter (still a hard safety guard).
     strategy_mode = None
     if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
         log(f"  ⏸️  Entry price ${price:.3f} outside global allowed range")
@@ -2176,7 +2249,47 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
-    log(f"  Strategy mode:   {strategy_mode}")
+    score, score_details = _score_entry_setup(
+        side=side,
+        momentum=momentum,
+        divergence=divergence,
+        min_divergence=min_divergence,
+        seconds_left=remaining,
+        yes_book=book if 'book' in locals() else None,
+        side_book=side_book,
+        side_price=buy_price_mid,
+    )
+
+    # Require both a positive edge and a strong overall score.
+    if score_details["edge"] <= 0:
+        log(f"  ⏸️  Score rejected: edge too weak after fees (divergence {divergence:.3f}, min {min_divergence:.3f})")
+        skip_reasons.append("insufficient edge")
+        _emit_skip_report()
+        return
+    if score < ENTRY_SCORE_THRESHOLD:
+        log(
+            f"  ⏸️  Score {score:.2f} < threshold {ENTRY_SCORE_THRESHOLD:.2f} "
+            f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}, "
+            f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}, time {score_details['time']:.2f}, "
+            f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
+        )
+        skip_reasons.append("entry score too low")
+        _emit_skip_report()
+        return
+
+    vol_note = f" | score {score:.2f}"
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] > 2.0:
+        vol_note += f" | high volume {momentum['volume_ratio']:.1f}x"
+
+    # We have a signal!
+    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
+
+    log(f"  Strategy mode:   {strategy_mode} | score {score:.2f}/{ENTRY_SCORE_THRESHOLD:.2f}")
+    log(
+        f"  Score factors:   mom {score_details['momentum']:.2f} | accel {score_details['acceleration']:.2f} | "
+        f"spread {score_details['spread']:.2f} | vol {score_details['volume']:.2f} | imb {score_details['imbalance']:.2f} | "
+        f"time {score_details['time']:.2f} | edge {score_details['edge']:.2f} | slip {score_details['slippage']:.2f}"
+    )
 
     # Open exposure check (capital recycles after exits; no cumulative daily budget cap)
     if dry_run:
@@ -2215,7 +2328,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             return
 
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
-    log(f"  Divergence: {divergence:.3f}", force=True)
+    log(f"  Divergence: {divergence:.3f} | est entry ${price:.3f} | fee floor {min_divergence:.3f}", force=True)
 
     # Step 5: Get market ID (already have it from Simmer API, or import from Gamma)
     if best.get("market_id"):
