@@ -57,7 +57,7 @@ CONFIG_SCHEMA = {
                       "help": "Price feed source (binance)"},
     "lookback_minutes": {"default": 5, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
                          "help": "Minutes of price history for momentum calc"},
-    "min_time_remaining": {"default": 30, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
+    "min_time_remaining": {"default": 120, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
                            "help": "Skip fast_markets with less than this many seconds remaining (0 = auto: 10%% of window)"},
     "asset": {"default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
               "help": "Asset to trade (BTC, ETH, SOL)"},
@@ -92,6 +92,7 @@ SMART_SIZING_PCT = 0.05  # 5% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
 MAX_SPREAD_PCT = 0.06     # Skip if CLOB bid-ask spread exceeds this
 MIN_ENTRY_PRICE = 0.05
+MIN_LIVE_ENTRY_PRICE = 0.12
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
@@ -105,6 +106,7 @@ FOCUSED_LIVE_SCAN_INTERVAL_SECONDS = 5  # tighter management cadence while a liv
 HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 _last_heartbeat_ts = 0
+_last_auto_redeem_ts = 0
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -146,7 +148,7 @@ _configured_min_time = cfg["min_time_remaining"]
 if _configured_min_time > 0:
     MIN_TIME_REMAINING = _configured_min_time
 else:
-    MIN_TIME_REMAINING = max(30, _window_seconds.get(WINDOW, 300) // 10)
+    MIN_TIME_REMAINING = max(120, _window_seconds.get(WINDOW, 300) // 10)
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
 DAILY_BUDGET = cfg["daily_budget"]
 MAX_OPEN_EXPOSURE = cfg["max_open_exposure"]
@@ -1789,7 +1791,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below 0.35 | contrarian disabled")
+    log(f"  Entry rules:      momentum only below 0.35 | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -1844,13 +1846,18 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     get_client(live=not dry_run)
 
     if not dry_run:
-        try:
-            redeem_results = get_client().auto_redeem()
-            redeemed = [r for r in (redeem_results or []) if isinstance(r, dict) and r.get("success")]
-            if redeemed:
-                log(f"  ✅ Auto-redeemed {len(redeemed)} resolved winning position(s).", force=True)
-        except Exception as e:
-            log(f"  ⚠️  Auto-redeem skipped: {e}")
+        global _last_auto_redeem_ts
+        now_redeem_ts = time.time()
+        if now_redeem_ts - _last_auto_redeem_ts >= 180:
+            try:
+                redeem_results = get_client().auto_redeem()
+                _last_auto_redeem_ts = now_redeem_ts
+                redeemed = [r for r in (redeem_results or []) if isinstance(r, dict) and r.get("success")]
+                if redeemed:
+                    log(f"  ✅ Auto-redeemed {len(redeemed)} resolved winning position(s).", force=True)
+            except Exception as e:
+                _last_auto_redeem_ts = now_redeem_ts
+                log(f"  ⚠️  Auto-redeem skipped: {e}")
 
     # Manage exits before looking for fresh entries
     paper_state, closed_paper_positions = manage_paper_positions(__file__, log)
@@ -2148,6 +2155,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
+    if not dry_run and price < MIN_LIVE_ENTRY_PRICE:
+        log(f"  ⏸️  Live entry price ${price:.3f} below minimum live floor ${MIN_LIVE_ENTRY_PRICE:.2f}")
+        skip_reasons.append("live min entry price")
+        _emit_skip_report()
+        return
+
     if price < MOMENTUM_MAX_ENTRY:
         strategy_mode = "momentum"
     else:
@@ -2404,7 +2417,7 @@ if __name__ == "__main__":
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
-            print(f"💓 Heartbeat {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')} | bot alive | monitoring for entry/exit")
+            print(f"💓 Heartbeat {datetime.now(ZoneInfo("America/New_York")).strftime('%Y-%m-%d %I:%M:%S %p ET')} | bot alive | monitoring for entry/exit")
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
