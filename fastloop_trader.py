@@ -2116,6 +2116,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 for m in markets:
                     m["fee_rate_bps"] = fee
 
+    def note_skip(reason):
+        _record_skip_reason(reason)
+
     if not markets:
         note_skip("no markets available")
         log("  No active fast markets found — may be outside market hours or wrong asset/window")
@@ -2152,8 +2155,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     _q = best.get("question", "").lower()
     skip_reasons = []
 
-    def note_skip(reason):
-        _record_skip_reason(reason)
     existing = [] if dry_run else get_positions()
     for pos in existing:
         held = (pos.get("shares_yes") or 0) + (pos.get("shares_no") or 0)
