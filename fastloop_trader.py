@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Simmer FastLoop Trading Skill - REVISED v2.1
+Simmer FastLoop Trading Skill - REVISED v2.2
 
-Changes from v2.0:
-- Added immediate startup confirmation prints (flush=True)
-- ACTION_ONLY_LOGS = False (show all logs for debugging)
-- Scan cycle timestamp printed at start of every loop
+Key fixes:
+- Removed MOMENTUM_MAX_ENTRY price cap that was blocking all near-50c trades
+- Lowered entry thresholds to actually generate signals
+- Fixed _find_trade_signal to work at any price level
+- Added detailed skip reason logging so we can see exactly why trades are rejected
 - All print statements use flush=True for Railway compatibility
-- Fixed timezone handling with tzdata package
-- Added comprehensive error logging throughout
-
-Trades Polymarket BTC 5-minute fast markets using CEX price momentum.
-Default signal: Coinbase BTC-USD candles (completed candles only).
+- Local entry record for reliable TP/SL tracking
+- Skips incomplete Coinbase candle[0]
 
 Usage:
     python fast_trader.py              # Dry run
@@ -20,7 +18,7 @@ Usage:
     python fast_trader.py --quiet      # Only output on trades/errors
 
 Requires:
-    SIMMER_API_KEY environment variable (get from simmer.markets/dashboard)
+    SIMMER_API_KEY environment variable
 """
 
 # =============================================================================
@@ -29,18 +27,15 @@ Requires:
 import sys
 import os
 
-# Force unbuffered output immediately
 os.environ['PYTHONUNBUFFERED'] = '1'
 
-# Flush startup confirmation before anything else loads
 print("=" * 60, flush=True)
-print("FASTLOOP v2.1 - CONTAINER STARTING", flush=True)
+print("FASTLOOP v2.2 - CONTAINER STARTING", flush=True)
 print(f"Python: {sys.version}", flush=True)
 print(f"PID: {os.getpid()}", flush=True)
 print("=" * 60, flush=True)
 sys.stdout.flush()
 
-# Now load remaining imports
 import json
 import math
 import argparse
@@ -53,32 +48,33 @@ from urllib.parse import urlencode, quote
 print("✅ Core imports loaded", flush=True)
 
 # =============================================================================
-# Timezone Helper - Railway/Docker compatible with tzdata package
+# Timezone Helper
 # =============================================================================
 
 def _safe_et_timestamp():
     """Get Eastern Time timestamp. Uses tzdata package if available."""
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/New_York")).strftime('%Y-%m-%d %I:%M:%S %p ET')
+        return datetime.now(ZoneInfo("America/New_York")).strftime(
+            '%Y-%m-%d %I:%M:%S %p ET'
+        )
     except Exception:
         pass
     try:
         now_utc = datetime.now(timezone.utc)
         month = now_utc.month
         day = now_utc.day
-        # Approximate EDT/EST detection
         if 3 < month < 11:
-            offset = timedelta(hours=-4)  # EDT
+            offset = timedelta(hours=-4)
             suffix = "EDT"
         elif month == 3 and day >= 8:
-            offset = timedelta(hours=-4)  # EDT after second Sunday March
+            offset = timedelta(hours=-4)
             suffix = "EDT"
         elif month == 11 and day < 7:
-            offset = timedelta(hours=-4)  # EDT before first Sunday Nov
+            offset = timedelta(hours=-4)
             suffix = "EDT"
         else:
-            offset = timedelta(hours=-5)  # EST
+            offset = timedelta(hours=-5)
             suffix = "EST"
         et_time = now_utc + offset
         return et_time.strftime(f'%Y-%m-%d %I:%M:%S %p {suffix}')
@@ -131,80 +127,118 @@ except ImportError:
 
 CONFIG_SCHEMA = {
     "entry_threshold": {
-        "default": 0.06, "env": "SIMMER_SPRINT_ENTRY", "type": float,
+        "default": 0.04,
+        "env": "SIMMER_SPRINT_ENTRY",
+        "type": float,
         "help": "Min CEX/CLOB divergence to trigger trade"
     },
     "min_momentum_pct": {
-        "default": 0.08, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
-        "help": "Min BTC % move in lookback window to trigger"
+        "default": 0.04,
+        "env": "SIMMER_SPRINT_MOMENTUM",
+        "type": float,
+        "help": "Min BTC pct move in lookback window to trigger"
     },
     "entry_score_threshold": {
-        "default": 0.55, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
+        "default": 0.45,
+        "env": "SIMMER_SPRINT_SCORE_THRESHOLD",
+        "type": float,
         "help": "Minimum multi-factor entry score (0-1)"
     },
     "max_position": {
-        "default": 2.5, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
-        "help": "Max $ per trade"
+        "default": 2.5,
+        "env": "SIMMER_SPRINT_MAX_POSITION",
+        "type": float,
+        "help": "Max dollars per trade"
     },
     "signal_source": {
-        "default": "coinbase", "env": "SIMMER_SPRINT_SIGNAL", "type": str,
+        "default": "coinbase",
+        "env": "SIMMER_SPRINT_SIGNAL",
+        "type": str,
         "help": "Price feed source (coinbase)"
     },
     "lookback_minutes": {
-        "default": 3, "env": "SIMMER_SPRINT_LOOKBACK", "type": int,
+        "default": 2,
+        "env": "SIMMER_SPRINT_LOOKBACK",
+        "type": int,
         "help": "Minutes of completed candles for momentum calc"
     },
     "min_time_remaining": {
-        "default": 150, "env": "SIMMER_SPRINT_MIN_TIME", "type": int,
-        "help": "Skip fast markets with less than this many seconds remaining"
+        "default": 120,
+        "env": "SIMMER_SPRINT_MIN_TIME",
+        "type": int,
+        "help": "Skip markets with less than this many seconds remaining"
     },
     "asset": {
-        "default": "BTC", "env": "SIMMER_SPRINT_ASSET", "type": str,
-        "help": "Asset to trade (BTC, ETH, SOL)"
+        "default": "BTC",
+        "env": "SIMMER_SPRINT_ASSET",
+        "type": str,
+        "help": "Asset to trade (BTC ETH SOL)"
     },
     "window": {
-        "default": "5m", "env": "SIMMER_SPRINT_WINDOW", "type": str,
+        "default": "5m",
+        "env": "SIMMER_SPRINT_WINDOW",
+        "type": str,
         "help": "Market window duration (5m or 15m)"
     },
     "volume_confidence": {
-        "default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
+        "default": True,
+        "env": "SIMMER_SPRINT_VOL_CONF",
+        "type": bool,
         "help": "Weight signal by volume"
     },
     "max_open_exposure": {
-        "default": 2.5, "env": "SIMMER_SPRINT_MAX_EXPOSURE", "type": float,
+        "default": 2.5,
+        "env": "SIMMER_SPRINT_MAX_EXPOSURE",
+        "type": float,
         "help": "Maximum simultaneous open exposure"
     },
     "take_profit_pct": {
-        "default": 0.12, "env": "SIMMER_SPRINT_TP", "type": float,
+        "default": 0.12,
+        "env": "SIMMER_SPRINT_TP",
+        "type": float,
         "help": "Take profit percentage"
     },
     "stop_loss_pct": {
-        "default": 0.07, "env": "SIMMER_SPRINT_SL", "type": float,
+        "default": 0.07,
+        "env": "SIMMER_SPRINT_SL",
+        "type": float,
         "help": "Stop loss percentage"
     },
     "daily_loss_limit": {
-        "default": 15.0, "env": "SIMMER_SPRINT_DAILY_LOSS", "type": float,
+        "default": 15.0,
+        "env": "SIMMER_SPRINT_DAILY_LOSS",
+        "type": float,
         "help": "Stop trading after this much loss in a UTC day"
     },
     "pause_hours_after_loss": {
-        "default": 1, "env": "SIMMER_SPRINT_PAUSE_HOURS", "type": int,
+        "default": 1,
+        "env": "SIMMER_SPRINT_PAUSE_HOURS",
+        "type": int,
         "help": "Pause hours after daily loss limit hit"
     },
     "resolution_exit_seconds": {
-        "default": 45, "env": "SIMMER_SPRINT_RESOLVE_EXIT", "type": int,
+        "default": 45,
+        "env": "SIMMER_SPRINT_RESOLVE_EXIT",
+        "type": int,
         "help": "Exit positions this many seconds before market expiry"
     },
     "daily_budget": {
-        "default": 0.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
-        "help": "Legacy (unused)"
+        "default": 0.0,
+        "env": "SIMMER_SPRINT_DAILY_BUDGET",
+        "type": float,
+        "help": "Legacy unused"
     },
     "daily_profit_target": {
-        "default": 0.0, "env": "SIMMER_SPRINT_DAILY_PROFIT", "type": float,
-        "help": "Legacy (unused)"
+        "default": 0.0,
+        "env": "SIMMER_SPRINT_DAILY_PROFIT",
+        "type": float,
+        "help": "Legacy unused"
     },
     "max_trades_per_day": {
-        "default": 0, "env": "SIMMER_SPRINT_MAX_TRADES", "type": int,
-        "help": "Legacy (unused)"
+        "default": 0,
+        "env": "SIMMER_SPRINT_MAX_TRADES",
+        "type": int,
+        "help": "Legacy unused"
     },
 }
 
@@ -218,20 +252,22 @@ _automaton_reported = False
 
 SMART_SIZING_PCT = 0.05
 MIN_SHARES_PER_ORDER = 5
-MAX_SPREAD_PCT = 0.06
+MAX_SPREAD_PCT = 0.08
 MIN_ENTRY_PRICE = 0.05
-MIN_LIVE_ENTRY_PRICE = 0.10
-MAX_ENTRY_PRICE = 0.95
-MOMENTUM_MAX_ENTRY = 0.45
+MIN_LIVE_ENTRY_PRICE = 0.08
+MAX_ENTRY_PRICE = 0.92
+
+# NOTE: MOMENTUM_MAX_ENTRY deliberately removed.
+# It was set to 0.45 and blocked ALL trades where YES price > $0.45
+# Since most fast markets hover near $0.50 this blocked nearly everything.
 
 SCAN_INTERVAL_SECONDS = 30
 LIVE_SCAN_INTERVAL_SECONDS = 15
 FOCUSED_LIVE_SCAN_INTERVAL_SECONDS = 3
-HEARTBEAT_SECONDS = 300          # Every 5 minutes
+HEARTBEAT_SECONDS = 300
 LIVE_TIME_STOP_SECONDS = 45
 LIVE_MAX_HOLD_SECONDS = 120
 
-# Show ALL logs for debugging - change to True once confirmed working
 ACTION_ONLY_LOGS = False
 
 _last_heartbeat_ts = 0
@@ -242,12 +278,6 @@ BAD_MARKET_COOLDOWN_CYCLES = 3
 
 POLY_FEE_RATE = 0.25
 POLY_FEE_EXPONENT = 2
-
-ASSET_SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "SOL": "SOLUSDT",
-}
 
 ASSET_COINBASE = {
     "BTC": "BTC-USD",
@@ -264,7 +294,7 @@ ASSET_PATTERNS = {
 CLOB_API = "https://clob.polymarket.com"
 
 # =============================================================================
-# Load Config from simmer_sdk
+# Load Config
 # =============================================================================
 
 print("⏳ Loading simmer_sdk...", flush=True)
@@ -287,7 +317,6 @@ except Exception as e:
     print(f"❌ FATAL: Config load failed: {e}", flush=True)
     sys.exit(1)
 
-# Apply config values
 ENTRY_THRESHOLD = cfg["entry_threshold"]
 MIN_MOMENTUM_PCT = cfg["min_momentum_pct"]
 ENTRY_SCORE_THRESHOLD = cfg["entry_score_threshold"]
@@ -314,14 +343,16 @@ PAUSE_HOURS_AFTER_LOSS = cfg["pause_hours_after_loss"]
 RESOLUTION_EXIT_SECONDS = cfg["resolution_exit_seconds"]
 
 print(f"✅ Config applied:", flush=True)
-print(f"   Asset: {ASSET} | Window: {WINDOW}", flush=True)
-print(f"   Max position: ${MAX_POSITION_USD:.2f}", flush=True)
-print(f"   TP: {TAKE_PROFIT_PCT:.0%} | SL: {STOP_LOSS_PCT:.0%}", flush=True)
-print(f"   Entry threshold: {ENTRY_THRESHOLD}", flush=True)
-print(f"   Min momentum: {MIN_MOMENTUM_PCT}%", flush=True)
+print(f"   Asset={ASSET} Window={WINDOW}", flush=True)
+print(f"   Max position=${MAX_POSITION_USD:.2f}", flush=True)
+print(f"   TP={TAKE_PROFIT_PCT:.0%} SL={STOP_LOSS_PCT:.0%}", flush=True)
+print(f"   Entry threshold={ENTRY_THRESHOLD}", flush=True)
+print(f"   Min momentum={MIN_MOMENTUM_PCT}%", flush=True)
+print(f"   Entry score threshold={ENTRY_SCORE_THRESHOLD}", flush=True)
+print(f"   Lookback={LOOKBACK_MINUTES} completed candles", flush=True)
 
 # =============================================================================
-# Local Entry Record - Stores entry data so TP/SL always has reliable prices
+# Local Entry Record
 # =============================================================================
 
 def _get_entry_record_path(skill_file):
@@ -333,8 +364,8 @@ def _save_entry_record(skill_file, market_id, question, side, entry_price,
                        shares, entry_cost, end_time, clob_token_ids=None):
     """
     Save entry record locally immediately after a successful trade.
-    CRITICAL: This is the authoritative source for entry_price.
-    Do NOT rely on Simmer position API which can be delayed or return 0.
+    This is the AUTHORITATIVE source for entry_price.
+    Do NOT rely on Simmer position API which can return 0 or be delayed.
     """
     path = _get_entry_record_path(skill_file)
     record = {
@@ -348,18 +379,24 @@ def _save_entry_record(skill_file, market_id, question, side, entry_price,
         "clob_token_ids": list(clob_token_ids) if clob_token_ids else [],
         "ts": datetime.now(timezone.utc).isoformat(),
         "target_price": round(float(entry_price) * (1 + TAKE_PROFIT_PCT), 6),
-        "stop_price": round(max(0.001, float(entry_price) * (1 - STOP_LOSS_PCT)), 6),
+        "stop_price": round(
+            max(0.001, float(entry_price) * (1 - STOP_LOSS_PCT)), 6
+        ),
     }
     with open(path, "w") as f:
         json.dump(record, f, indent=2)
-    print(f"✅ Entry record saved: {side.upper()} @ ${entry_price:.3f} "
-          f"| TP ${record['target_price']:.3f} | SL ${record['stop_price']:.3f}", flush=True)
+    print(
+        f"✅ Entry record saved: {side.upper()} @ ${entry_price:.3f} | "
+        f"TP ${record['target_price']:.3f} | SL ${record['stop_price']:.3f}",
+        flush=True
+    )
     return record
 
 
 def _load_entry_record(skill_file):
     """Load current entry record. Returns None if no active entry."""
-    path = _get_entry_record_path(skill_file)
+    from pathlib import Path
+    path = Path(skill_file).parent / "current_entry.json"
     if not path.exists():
         return None
     try:
@@ -396,8 +433,7 @@ def _entry_record_is_expired(record):
         end_time = datetime.fromisoformat(end_str)
         if end_time.tzinfo is None:
             end_time = end_time.replace(tzinfo=timezone.utc)
-        expired = datetime.now(timezone.utc) > end_time + timedelta(seconds=30)
-        return expired
+        return datetime.now(timezone.utc) > end_time + timedelta(seconds=30)
     except Exception:
         return False
 
@@ -459,7 +495,8 @@ def _load_paper_state(skill_file):
         try:
             with open(path) as f:
                 data = json.load(f)
-            if data.get("date") == today and isinstance(data.get("open_positions", []), list):
+            if (data.get("date") == today and
+                    isinstance(data.get("open_positions", []), list)):
                 data.setdefault("spent", 0.0)
                 data.setdefault("trades", 0)
                 data.setdefault("realized_pnl", 0.0)
@@ -545,12 +582,18 @@ def _guard_pause_remaining(skill_file):
 
 def _activate_loss_pause(skill_file, realized_pnl, reason="daily_loss_stop"):
     state = _load_guard_state(skill_file)
-    until = datetime.now(timezone.utc) + timedelta(hours=int(PAUSE_HOURS_AFTER_LOSS))
+    until = datetime.now(timezone.utc) + timedelta(
+        hours=int(PAUSE_HOURS_AFTER_LOSS)
+    )
     state["pause_until"] = until.isoformat()
     state["reason"] = reason
     state["trigger_pnl"] = round(float(realized_pnl), 6)
     _save_guard_state(skill_file, state)
-    print(f"⏸️ Loss pause activated: {reason} | Resume at {until.isoformat()}", flush=True)
+    print(
+        f"⏸️ Loss pause activated: {reason} | "
+        f"Resume at {until.isoformat()}",
+        flush=True
+    )
     return state
 
 
@@ -583,7 +626,11 @@ def _save_bad_markets(skill_file, data):
 
 
 def _market_cache_key(market):
-    return str(market.get("market_id") or market.get("slug") or market.get("question") or "")
+    return str(
+        market.get("market_id") or
+        market.get("slug") or
+        market.get("question") or ""
+    )
 
 
 def _cooldown_is_active(cooldowns, market):
@@ -591,7 +638,9 @@ def _cooldown_is_active(cooldowns, market):
     return cooldowns.get(key, 0) > 0
 
 
-def _set_market_cooldown(skill_file, market, cycles=BAD_MARKET_COOLDOWN_CYCLES):
+def _set_market_cooldown(
+    skill_file, market, cycles=BAD_MARKET_COOLDOWN_CYCLES
+):
     cooldowns = _load_bad_markets(skill_file)
     key = _market_cache_key(market)
     if key:
@@ -641,18 +690,23 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
     try:
         req_headers = headers or {}
         if "User-Agent" not in req_headers:
-            req_headers["User-Agent"] = "simmer-fastloop/2.1"
+            req_headers["User-Agent"] = "simmer-fastloop/2.2"
         body = None
         if data:
             body = json.dumps(data).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
-        req = Request(url, data=body, headers=req_headers, method=method)
+        req = Request(
+            url, data=body, headers=req_headers, method=method
+        )
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         try:
             error_body = json.loads(e.read().decode("utf-8"))
-            return {"error": error_body.get("detail", str(e)), "status_code": e.code}
+            return {
+                "error": error_body.get("detail", str(e)),
+                "status_code": e.code
+            }
         except Exception:
             return {"error": str(e), "status_code": e.code}
     except URLError as e:
@@ -675,19 +729,31 @@ def get_client(live=True):
         try:
             from simmer_sdk import SimmerClient
         except ImportError:
-            print("❌ FATAL: simmer-sdk not installed. Run: pip install simmer-sdk", flush=True)
+            print(
+                "❌ FATAL: simmer-sdk not installed. "
+                "Run: pip install simmer-sdk",
+                flush=True
+            )
             sys.exit(1)
         api_key = os.environ.get("SIMMER_API_KEY")
         if not api_key:
-            print("❌ FATAL: SIMMER_API_KEY environment variable not set", flush=True)
+            print(
+                "❌ FATAL: SIMMER_API_KEY environment variable not set",
+                flush=True
+            )
             sys.exit(1)
         print(f"⏳ Connecting to Simmer (live={live})...", flush=True)
         venue = os.environ.get("TRADING_VENUE", "polymarket")
         try:
-            _client = SimmerClient(api_key=api_key, venue=venue, live=live)
+            _client = SimmerClient(
+                api_key=api_key, venue=venue, live=live
+            )
             print("✅ Simmer client connected", flush=True)
         except Exception as e:
-            print(f"❌ FATAL: Simmer client connection failed: {e}", flush=True)
+            print(
+                f"❌ FATAL: Simmer client connection failed: {e}",
+                flush=True
+            )
             sys.exit(1)
     return _client
 
@@ -737,8 +803,11 @@ def execute_trade(market_id, side, amount=None, shares=None, action="buy"):
             kwargs["amount"] = amount
         if shares is not None:
             kwargs["shares"] = shares
-        print(f"⏳ Executing trade: {action} {side.upper()} "
-              f"{'$' + str(round(amount, 2)) if amount else str(shares) + ' shares'}", flush=True)
+        print(
+            f"⏳ Executing trade: {action} {side.upper()} "
+            f"{'$'+str(round(amount,2)) if amount else str(shares)+' shares'}",
+            flush=True
+        )
         result = get_client().trade(**kwargs)
         trade_result = {
             "success": getattr(result, "success", False),
@@ -749,11 +818,14 @@ def execute_trade(market_id, side, amount=None, shares=None, action="buy"):
             "error": getattr(result, "error", None),
             "simulated": getattr(result, "simulated", False),
         }
-        print(f"   Trade result: success={trade_result['success']} | "
-              f"shares={trade_result['shares_bought']} | "
-              f"cost={trade_result['cost']} | "
-              f"simulated={trade_result['simulated']} | "
-              f"error={trade_result['error']}", flush=True)
+        print(
+            f"   Result: success={trade_result['success']} | "
+            f"shares={trade_result['shares_bought']} | "
+            f"cost={trade_result['cost']} | "
+            f"simulated={trade_result['simulated']} | "
+            f"error={trade_result['error']}",
+            flush=True
+        )
         return trade_result
     except Exception as e:
         print(f"❌ execute_trade exception: {e}", flush=True)
@@ -778,7 +850,10 @@ def calculate_position_size(max_size, smart_sizing=False):
 # =============================================================================
 
 def _lookup_fee_rate(token_id):
-    result = _api_request(f"{CLOB_API}/fee-rate?token_id={quote(str(token_id))}", timeout=5)
+    result = _api_request(
+        f"{CLOB_API}/fee-rate?token_id={quote(str(token_id))}",
+        timeout=5
+    )
     if not result or not isinstance(result, dict) or result.get("error"):
         return 0
     try:
@@ -788,7 +863,10 @@ def _lookup_fee_rate(token_id):
 
 
 def fetch_live_midpoint(token_id):
-    result = _api_request(f"{CLOB_API}/midpoint?token_id={quote(str(token_id))}", timeout=5)
+    result = _api_request(
+        f"{CLOB_API}/midpoint?token_id={quote(str(token_id))}",
+        timeout=5
+    )
     if not result or not isinstance(result, dict) or result.get("error"):
         return None
     try:
@@ -801,8 +879,7 @@ def fetch_live_prices(clob_token_ids):
     """Fetch live YES midpoint from Polymarket CLOB."""
     if not clob_token_ids or len(clob_token_ids) < 1:
         return None
-    yes_token = clob_token_ids[0]
-    return fetch_live_midpoint(yes_token)
+    return fetch_live_midpoint(clob_token_ids[0])
 
 
 def fetch_orderbook_summary(clob_token_ids):
@@ -810,7 +887,10 @@ def fetch_orderbook_summary(clob_token_ids):
     if not clob_token_ids or len(clob_token_ids) < 1:
         return None
     yes_token = clob_token_ids[0]
-    result = _api_request(f"{CLOB_API}/book?token_id={quote(str(yes_token))}", timeout=5)
+    result = _api_request(
+        f"{CLOB_API}/book?token_id={quote(str(yes_token))}",
+        timeout=5
+    )
     if not result or not isinstance(result, dict):
         return None
     bids = result.get("bids", [])
@@ -823,8 +903,14 @@ def fetch_orderbook_summary(clob_token_ids):
         spread = best_ask - best_bid
         mid = (best_ask + best_bid) / 2
         spread_pct = spread / mid if mid > 0 else 0
-        bid_depth = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids[:5])
-        ask_depth = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks[:5])
+        bid_depth = sum(
+            float(b.get("size", 0)) * float(b.get("price", 0))
+            for b in bids[:5]
+        )
+        ask_depth = sum(
+            float(a.get("size", 0)) * float(a.get("price", 0))
+            for a in asks[:5]
+        )
         return {
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -844,7 +930,10 @@ def fetch_side_orderbook_summary(clob_token_ids, side="yes"):
     if len(clob_token_ids) <= idx:
         return None
     token_id = clob_token_ids[idx]
-    result = _api_request(f"{CLOB_API}/book?token_id={quote(str(token_id))}", timeout=5)
+    result = _api_request(
+        f"{CLOB_API}/book?token_id={quote(str(token_id))}",
+        timeout=5
+    )
     if not result or not isinstance(result, dict):
         return None
     bids = result.get("bids", []) or []
@@ -858,8 +947,18 @@ def fetch_side_orderbook_summary(clob_token_ids, side="yes"):
             spread = best_ask - best_bid
             mid = (best_ask + best_bid) / 2
             spread_pct = spread / mid if mid and mid > 0 else None
-        bid_depth = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids[:5]) if bids else 0.0
-        ask_depth = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks[:5]) if asks else 0.0
+        bid_depth = (
+            sum(
+                float(b.get("size", 0)) * float(b.get("price", 0))
+                for b in bids[:5]
+            ) if bids else 0.0
+        )
+        ask_depth = (
+            sum(
+                float(a.get("size", 0)) * float(a.get("price", 0))
+                for a in asks[:5]
+            ) if asks else 0.0
+        )
         return {
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -873,44 +972,51 @@ def fetch_side_orderbook_summary(clob_token_ids, side="yes"):
 
 
 # =============================================================================
-# CEX Price Signal - FIXED: Skip incomplete candle[0]
+# CEX Price Signal - FIXED: skip incomplete candle[0]
 # =============================================================================
 
-def get_coinbase_momentum(asset="BTC", lookback_minutes=3):
+def get_coinbase_momentum(asset="BTC", lookback_minutes=2):
     """
     Get price momentum from Coinbase API.
 
     CRITICAL FIX: candles[0] is the CURRENT INCOMPLETE candle.
     We skip it and start from candles[1] (last completed candle).
     Using an incomplete candle causes false momentum signals.
+
+    Coinbase candle format: [timestamp, low, high, open, close, volume]
     """
     product = ASSET_COINBASE.get(asset, "BTC-USD")
-    url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60"
+    url = (
+        f"https://api.exchange.coinbase.com/products/"
+        f"{product}/candles?granularity=60"
+    )
 
     print(f"  📡 Fetching Coinbase {product} candles...", flush=True)
     result = _api_request(url, timeout=10)
 
     if not result:
-        print(f"  ❌ Coinbase API returned empty response", flush=True)
+        print("  ❌ Coinbase API returned empty response", flush=True)
         return None
     if isinstance(result, dict):
         print(f"  ❌ Coinbase API error: {result.get('error', result)}", flush=True)
         return None
 
     try:
-        print(f"  📊 Got {len(result)} candles from Coinbase", flush=True)
+        print(f"  📊 Got {len(result)} candles total", flush=True)
 
-        # SKIP candles[0] - current incomplete candle
-        # candles[1] = most recent COMPLETED 1-minute candle
-        # Format: [timestamp, low, high, open, close, volume]
+        # SKIP candles[0] - it is the current incomplete candle
         completed = result[1:]
 
         if len(completed) < lookback_minutes + 1:
-            print(f"  ⚠️ Not enough completed candles: {len(completed)} < {lookback_minutes + 1}", flush=True)
+            print(
+                f"  ⚠️ Not enough completed candles: "
+                f"{len(completed)} < {lookback_minutes + 1}",
+                flush=True
+            )
             return None
 
-        price_now = float(completed[0][4])    # Most recent completed close
-        price_then = float(completed[lookback_minutes - 1][4])  # N minutes ago
+        price_now = float(completed[0][4])
+        price_then = float(completed[lookback_minutes - 1][4])
 
         if price_then <= 0:
             print(f"  ⚠️ Invalid price_then: {price_then}", flush=True)
@@ -930,7 +1036,9 @@ def get_coinbase_momentum(asset="BTC", lookback_minutes=3):
             prior_close = float(completed[2][4])
             prev_close_2 = float(completed[1][4])
             if prior_close > 0:
-                prior_pct = ((prev_close_2 - prior_close) / prior_close) * 100
+                prior_pct = (
+                    (prev_close_2 - prior_close) / prior_close
+                ) * 100
 
         acceleration_pct = recent_pct - prior_pct
 
@@ -939,10 +1047,13 @@ def get_coinbase_momentum(asset="BTC", lookback_minutes=3):
         latest_volume = volumes[0] if volumes else 0.0
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
 
-        print(f"  💹 BTC: ${price_now:,.2f} (was ${price_then:,.2f}) | "
-              f"momentum: {momentum_pct:+.3f}% | "
-              f"direction: {direction} | "
-              f"volume ratio: {volume_ratio:.2f}x", flush=True)
+        print(
+            f"  💹 BTC: ${price_now:,.2f} (was ${price_then:,.2f}) | "
+            f"momentum: {momentum_pct:+.4f}% | "
+            f"direction: {direction} | "
+            f"volume ratio: {volume_ratio:.2f}x",
+            flush=True
+        )
 
         return {
             "momentum_pct": momentum_pct,
@@ -957,65 +1068,107 @@ def get_coinbase_momentum(asset="BTC", lookback_minutes=3):
             "candles": len(completed),
         }
     except Exception as e:
-        print(f"  ❌ Coinbase momentum calculation error: {e}", flush=True)
+        print(f"  ❌ Coinbase momentum error: {e}", flush=True)
         return None
 
 
-def get_momentum(asset="BTC", source="coinbase", lookback=3):
+def get_momentum(asset="BTC", source="coinbase", lookback=2):
     """Get price momentum from configured source."""
     return get_coinbase_momentum(asset, lookback)
 
 
 # =============================================================================
-# REVISED Entry Signal - Mean Reversion / CEX-CLOB Divergence
+# Entry Signal - CEX/CLOB Divergence (Mean Reversion)
 # =============================================================================
 
 def _find_trade_signal(momentum, market_yes_price, remaining_seconds):
     """
-    REVISED: Find trade signal based on CEX/CLOB divergence.
+    Find trade signal based on CEX/CLOB divergence.
 
-    Previous (WRONG): Buy YES when BTC going UP - chases already-priced moves.
+    Works at ANY price level. No arbitrary price cap.
 
-    Correct: Find where CLOB price HASN'T caught up to CEX signal yet.
+    Logic:
     - Calculate where YES SHOULD be priced given BTC momentum
     - If actual YES < implied YES by enough to cover fees -> buy YES
     - If actual YES > implied YES by enough to cover fees -> buy NO
-
-    The edge is the gap between Polymarket's current price and
-    where Coinbase momentum says it should be.
     """
-    momentum_pct = momentum["momentum_pct"]  # signed
+    momentum_pct = momentum["momentum_pct"]
     volume_ratio = momentum["volume_ratio"]
+    abs_momentum = abs(momentum_pct)
 
-    if volume_ratio < 0.3:
-        return None, None, f"volume too low ({volume_ratio:.2f}x)"
+    print(
+        f"  🔎 Signal check: momentum={momentum_pct:+.4f}% | "
+        f"volume={volume_ratio:.2f}x | "
+        f"YES=${market_yes_price:.3f}",
+        flush=True
+    )
+
+    if volume_ratio < 0.25:
+        reason = f"volume too low ({volume_ratio:.2f}x < 0.25x)"
+        print(f"  ⛔ No signal: {reason}", flush=True)
+        return None, None, reason
+
+    if abs_momentum < MIN_MOMENTUM_PCT:
+        reason = f"momentum {abs_momentum:.4f}% < min {MIN_MOMENTUM_PCT}%"
+        print(f"  ⛔ No signal: {reason}", flush=True)
+        return None, None, reason
 
     # CEX-implied YES probability
-    # 1% BTC move = ~15 cent shift in fair value (conservative)
+    # 1% BTC move = ~15 cent shift in fair value
     SCALE_FACTOR = 15.0
     implied_yes = 0.50 + (momentum_pct / 100.0) * SCALE_FACTOR
-    implied_yes = max(0.15, min(0.85, implied_yes))
+    implied_yes = max(0.10, min(0.90, implied_yes))
 
     clob_divergence = implied_yes - market_yes_price
 
     # Fee-aware minimum edge
-    buy_price = market_yes_price if clob_divergence > 0 else (1.0 - market_yes_price)
-    fee_estimate = POLY_FEE_RATE * (buy_price * (1 - buy_price)) ** POLY_FEE_EXPONENT
+    if clob_divergence > 0:
+        buy_price = market_yes_price
+    else:
+        buy_price = 1.0 - market_yes_price
+
+    fee_estimate = (
+        POLY_FEE_RATE * (buy_price * (1 - buy_price)) ** POLY_FEE_EXPONENT
+    )
     min_edge = fee_estimate * 2 + ENTRY_THRESHOLD
 
-    print(f"  🧮 Signal calc: BTC {momentum_pct:+.3f}% | "
-          f"implied YES ${implied_yes:.3f} | "
-          f"actual YES ${market_yes_price:.3f} | "
-          f"divergence {clob_divergence:+.3f} | "
-          f"min edge {min_edge:.3f}", flush=True)
+    print(
+        f"  🧮 implied_yes=${implied_yes:.3f} | "
+        f"actual_yes=${market_yes_price:.3f} | "
+        f"divergence={clob_divergence:+.3f} | "
+        f"min_edge={min_edge:.3f} | "
+        f"fee_est={fee_estimate:.4f}",
+        flush=True
+    )
 
     if clob_divergence > min_edge:
+        print(
+            f"  ✅ Signal: YES "
+            f"(CLOB underpriced by {clob_divergence:.3f})",
+            flush=True
+        )
         return "yes", clob_divergence, None
+
     elif clob_divergence < -min_edge:
+        print(
+            f"  ✅ Signal: NO "
+            f"(CLOB overpriced YES by {abs(clob_divergence):.3f})",
+            flush=True
+        )
         return "no", abs(clob_divergence), None
 
-    return None, None, f"divergence {clob_divergence:.3f} < min edge {min_edge:.3f}"
+    else:
+        reason = (
+            f"divergence {clob_divergence:.3f} within dead zone "
+            f"[-{min_edge:.3f}, +{min_edge:.3f}]"
+        )
+        print(f"  ⛔ No signal: {reason}", flush=True)
+        return None, None, reason
 
+
+# =============================================================================
+# Multi-Factor Entry Score
+# =============================================================================
 
 def _clamp01(value):
     try:
@@ -1025,33 +1178,48 @@ def _clamp01(value):
 
 
 def _score_entry_setup(side, momentum, divergence, min_divergence,
-                       seconds_left, yes_book=None, side_book=None, side_price=None):
+                       seconds_left, yes_book=None, side_book=None,
+                       side_price=None):
     """Multi-factor entry score. Returns (score, details)."""
     momentum_pct = abs(float(momentum.get("momentum_pct", 0.0) or 0.0))
-    recent_pct = abs(float(momentum.get("recent_momentum_pct", 0.0) or 0.0))
-    acceleration_pct = float(momentum.get("acceleration_pct", 0.0) or 0.0)
+    recent_pct = abs(
+        float(momentum.get("recent_momentum_pct", 0.0) or 0.0)
+    )
+    acceleration_pct = float(
+        momentum.get("acceleration_pct", 0.0) or 0.0
+    )
     direction = str(momentum.get("direction") or "").lower()
     volume_ratio = float(momentum.get("volume_ratio", 1.0) or 1.0)
 
     spread_source = side_book or yes_book or {}
-    spread_pct = float(spread_source.get("spread_pct") or 0.0) if spread_source else 0.0
+    spread_pct = (
+        float(spread_source.get("spread_pct") or 0.0)
+        if spread_source else 0.0
+    )
 
     momentum_score = _clamp01(
-        (momentum_pct - MIN_MOMENTUM_PCT) / max(0.0001, 0.30 - MIN_MOMENTUM_PCT)
+        (momentum_pct - MIN_MOMENTUM_PCT) /
+        max(0.0001, 0.30 - MIN_MOMENTUM_PCT)
     )
 
     recent_aligned = 1.0 if (
-        (direction == "up" and float(momentum.get("recent_momentum_pct", 0.0) or 0.0) > 0) or
-        (direction == "down" and float(momentum.get("recent_momentum_pct", 0.0) or 0.0) < 0)
+        (direction == "up" and
+         float(momentum.get("recent_momentum_pct", 0.0) or 0.0) > 0) or
+        (direction == "down" and
+         float(momentum.get("recent_momentum_pct", 0.0) or 0.0) < 0)
     ) else 0.0
 
-    aligned_accel = acceleration_pct if direction == "up" else -acceleration_pct
+    aligned_accel = (
+        acceleration_pct if direction == "up" else -acceleration_pct
+    )
     acceleration_score = _clamp01(
         0.55 * _clamp01(recent_pct / 0.06) * recent_aligned +
         0.45 * _clamp01(aligned_accel / 0.05)
     )
 
-    spread_score = _clamp01(1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6)))
+    spread_score = _clamp01(
+        1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6))
+    )
     volume_score = _clamp01((volume_ratio - 0.30) / 1.70)
 
     imbalance_score = 0.45
@@ -1069,14 +1237,20 @@ def _score_entry_setup(side, momentum, divergence, min_divergence,
         max(1.0, window_secs - float(MIN_TIME_REMAINING))
     )
 
-    edge_score = _clamp01((float(divergence) - float(min_divergence)) / 0.10)
+    edge_score = _clamp01(
+        (float(divergence) - float(min_divergence)) / 0.10
+    )
 
     slippage_score = 0.50
     if side_book and side_price:
         best_ask = side_book.get("best_ask")
         try:
             if best_ask is not None and side_price > 0:
-                slip_pct = max(0.0, (float(best_ask) - float(side_price)) / float(side_price))
+                slip_pct = max(
+                    0.0,
+                    (float(best_ask) - float(side_price)) /
+                    float(side_price)
+                )
                 slippage_score = _clamp01(1.0 - (slip_pct / 0.05))
         except Exception:
             pass
@@ -1119,7 +1293,9 @@ def _score_entry_setup(side, momentum, divergence, min_divergence,
 # =============================================================================
 
 def _estimate_fee_per_share(price):
-    return price * (POLY_FEE_RATE * (price * (1 - price)) ** POLY_FEE_EXPONENT)
+    return price * (
+        POLY_FEE_RATE * (price * (1 - price)) ** POLY_FEE_EXPONENT
+    )
 
 
 # =============================================================================
@@ -1153,36 +1329,47 @@ def _parse_fast_market_end_time(question):
         year = datetime.now(timezone.utc).year
         dt_str = f"{date_str} {year} {time_str}"
         dt_naive = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-
         et_zone = _get_et_zone()
         if et_zone != timezone.utc:
             from zoneinfo import ZoneInfo
-            dt = dt_naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+            dt = dt_naive.replace(
+                tzinfo=ZoneInfo("America/New_York")
+            ).astimezone(timezone.utc)
         else:
             now_utc = datetime.now(timezone.utc)
-            month = now_utc.month
-            if 3 < month < 11:
-                offset_hours = 4
-            else:
-                offset_hours = 5
-            dt = dt_naive.replace(tzinfo=timezone.utc) + timedelta(hours=offset_hours)
+            offset_hours = 4 if 3 < now_utc.month < 11 else 5
+            dt = (
+                dt_naive.replace(tzinfo=timezone.utc) +
+                timedelta(hours=offset_hours)
+            )
         return dt
     except Exception as e:
-        print(f"  ⚠️ Could not parse market end time from '{question}': {e}", flush=True)
+        print(
+            f"  ⚠️ Could not parse end time from '{question}': {e}",
+            flush=True
+        )
         return None
 
 
 def discover_fast_market_markets(asset="BTC", window="5m"):
     """Find active fast markets via Simmer API, falling back to Gamma."""
-    print(f"  🔍 Querying Simmer fast markets API...", flush=True)
+    print("  🔍 Querying Simmer fast markets API...", flush=True)
     try:
         client = get_client()
-        sdk_markets = client.get_fast_markets(asset=asset, window=window, limit=50)
+        sdk_markets = client.get_fast_markets(
+            asset=asset, window=window, limit=50
+        )
         if sdk_markets:
             markets = []
             for m in sdk_markets:
-                end_time = _parse_resolves_at(m.resolves_at) if m.resolves_at else None
-                clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
+                end_time = (
+                    _parse_resolves_at(m.resolves_at)
+                    if m.resolves_at else None
+                )
+                clob_tokens = (
+                    [m.polymarket_token_id]
+                    if m.polymarket_token_id else []
+                )
                 if m.polymarket_no_token_id:
                     clob_tokens.append(m.polymarket_no_token_id)
                 markets.append({
@@ -1197,17 +1384,23 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
                     "fee_rate_bps": getattr(m, 'fee_rate_bps', 0),
                     "source": "simmer",
                 })
-            print(f"  ✅ Simmer API returned {len(markets)} fast markets", flush=True)
+            print(
+                f"  ✅ Simmer returned {len(markets)} fast markets",
+                flush=True
+            )
             return markets
     except Exception as e:
-        print(f"  ⚠️ Simmer fast-markets API failed ({e}), trying Gamma fallback...", flush=True)
+        print(
+            f"  ⚠️ Simmer API failed ({e}), trying Gamma...",
+            flush=True
+        )
 
     return _discover_via_gamma(asset, window)
 
 
 def _discover_via_gamma(asset="BTC", window="5m"):
     """Fallback: Find active fast markets via Gamma API."""
-    print(f"  🔍 Querying Gamma API fallback...", flush=True)
+    print("  🔍 Querying Gamma API fallback...", flush=True)
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     url = (
         "https://gamma-api.polymarket.com/markets"
@@ -1215,7 +1408,7 @@ def _discover_via_gamma(asset="BTC", window="5m"):
     )
     result = _api_request(url)
     if not result or (isinstance(result, dict) and result.get("error")):
-        print(f"  ❌ Gamma API also failed", flush=True)
+        print("  ❌ Gamma API also failed", flush=True)
         return []
 
     markets = []
@@ -1226,7 +1419,9 @@ def _discover_via_gamma(asset="BTC", window="5m"):
         if any(p in q for p in patterns) and matches_window:
             closed = m.get("closed", False)
             if not closed and slug:
-                end_time = _parse_fast_market_end_time(m.get("question", ""))
+                end_time = _parse_fast_market_end_time(
+                    m.get("question", "")
+                )
                 clob_tokens_raw = m.get("clobTokenIds", "[]")
                 if isinstance(clob_tokens_raw, str):
                     try:
@@ -1241,10 +1436,16 @@ def _discover_via_gamma(asset="BTC", window="5m"):
                     "condition_id": m.get("conditionId", ""),
                     "end_time": end_time,
                     "clob_token_ids": clob_tokens,
-                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+                    "fee_rate_bps": int(
+                        m.get("fee_rate_bps") or
+                        m.get("feeRateBps") or 0
+                    ),
                     "source": "gamma",
                 })
-    print(f"  ✅ Gamma API returned {len(markets)} matching markets", flush=True)
+    print(
+        f"  ✅ Gamma returned {len(markets)} matching markets",
+        flush=True
+    )
     return markets
 
 
@@ -1257,13 +1458,30 @@ def find_best_fast_market(markets):
     for m in markets:
         if m.get("is_live_now") is not None:
             if not m["is_live_now"]:
+                print(
+                    f"  ⏭️ Skip (not live): "
+                    f"{m['question'][:50]}...",
+                    flush=True
+                )
                 continue
             end_time = m.get("end_time")
             if end_time:
                 remaining = (end_time - now).total_seconds()
                 if remaining > MIN_TIME_REMAINING:
                     candidates.append((remaining, m))
-                    print(f"  ✅ Candidate: {m['question'][:50]}... ({remaining:.0f}s remaining)", flush=True)
+                    print(
+                        f"  ✅ Candidate: "
+                        f"{m['question'][:50]}... "
+                        f"({remaining:.0f}s remaining)",
+                        flush=True
+                    )
+                else:
+                    print(
+                        f"  ⏭️ Skip (too little time): "
+                        f"{m['question'][:50]}... "
+                        f"({remaining:.0f}s < {MIN_TIME_REMAINING}s)",
+                        flush=True
+                    )
         else:
             end_time = m.get("end_time")
             if not end_time:
@@ -1271,7 +1489,12 @@ def find_best_fast_market(markets):
             remaining = (end_time - now).total_seconds()
             if MIN_TIME_REMAINING < remaining < max_remaining:
                 candidates.append((remaining, m))
-                print(f"  ✅ Candidate: {m['question'][:50]}... ({remaining:.0f}s remaining)", flush=True)
+                print(
+                    f"  ✅ Candidate: "
+                    f"{m['question'][:50]}... "
+                    f"({remaining:.0f}s remaining)",
+                    flush=True
+                )
 
     if not candidates:
         return None
@@ -1304,11 +1527,11 @@ def import_fast_market_market(slug):
     if status == "resolved":
         alternatives = result.get("active_alternatives", [])
         if alternatives:
-            return None, f"Market resolved. Try: {alternatives[0].get('id')}"
-        return None, "Market resolved, no alternatives"
+            return None, f"Resolved. Try: {alternatives[0].get('id')}"
+        return None, "Resolved, no alternatives"
 
     if status in ("imported", "already_exists"):
-        print(f"  ✅ Market imported: {market_id}", flush=True)
+        print(f"  ✅ Market ready: {market_id}", flush=True)
         return market_id, None
 
     return None, f"Unexpected status: {status}"
@@ -1330,46 +1553,70 @@ def manage_paper_positions(skill_file, log):
 
     for pos in open_positions:
         clob_tokens = pos.get("clob_token_ids") or []
-        yes_price = fetch_live_prices(clob_tokens) if clob_tokens else None
+        yes_price = (
+            fetch_live_prices(clob_tokens) if clob_tokens else None
+        )
         if yes_price is None:
             remaining_positions.append(pos)
             continue
 
-        current_price = yes_price if pos.get("side") == "yes" else (1 - yes_price)
+        current_price = (
+            yes_price if pos.get("side") == "yes"
+            else (1 - yes_price)
+        )
         target_price = float(pos.get("target_price", 0.0))
         stop_price = float(pos.get("stop_price", 0.0))
 
         end_time_str = pos.get("end_time")
-        end_time = _parse_resolves_at(end_time_str) if isinstance(end_time_str, str) else end_time_str
+        end_time = (
+            _parse_resolves_at(end_time_str)
+            if isinstance(end_time_str, str)
+            else end_time_str
+        )
         seconds_left = None
         if end_time:
-            seconds_left = (end_time - datetime.now(timezone.utc)).total_seconds()
+            seconds_left = (
+                end_time - datetime.now(timezone.utc)
+            ).total_seconds()
 
         reason = None
         if current_price >= target_price > 0:
             reason = "take_profit"
         elif current_price <= stop_price < 1:
             reason = "stop_loss"
-        elif seconds_left is not None and seconds_left <= RESOLUTION_EXIT_SECONDS:
+        elif (seconds_left is not None and
+              seconds_left <= RESOLUTION_EXIT_SECONDS):
             reason = "time_exit"
 
         if reason:
             shares = float(pos.get("shares", 0.0))
             entry_price = float(pos.get("entry_price", 0.0))
-            entry_fee = float(pos.get("entry_fee_per_share", _estimate_fee_per_share(entry_price)))
+            entry_fee = float(
+                pos.get(
+                    "entry_fee_per_share",
+                    _estimate_fee_per_share(entry_price)
+                )
+            )
             exit_fee = float(_estimate_fee_per_share(current_price))
             gross = shares * (current_price - entry_price)
             fees = shares * (entry_fee + exit_fee)
             realized = gross - fees
 
-            state["realized_pnl"] = round(float(state.get("realized_pnl", 0.0)) + realized, 6)
+            state["realized_pnl"] = round(
+                float(state.get("realized_pnl", 0.0)) + realized, 6
+            )
             if realized >= 0:
                 state["wins"] = int(state.get("wins", 0)) + 1
             else:
                 state["losses"] = int(state.get("losses", 0)) + 1
 
-            print(f"✅ [PAPER] Sold {shares:.1f} {str(pos.get('side', '')).upper()} "
-                  f"@ ${current_price:.3f} ({reason}, P&L ${realized:.2f})", flush=True)
+            print(
+                f"✅ [PAPER] Sold {shares:.1f} "
+                f"{str(pos.get('side', '')).upper()} "
+                f"@ ${current_price:.3f} "
+                f"({reason}, P&L ${realized:.2f})",
+                flush=True
+            )
             closed.append({
                 "question": pos.get("question", "Unknown"),
                 "side": pos.get("side"),
@@ -1389,27 +1636,25 @@ def manage_paper_positions(skill_file, log):
 
 
 # =============================================================================
-# REVISED Live Position Management - Uses local entry record
+# Live Position Management - Uses local entry record
 # =============================================================================
 
 def manage_live_positions_v2(skill_file, log):
     """
-    REVISED: Manage live positions using local entry record.
-
-    CRITICAL FIX: Uses locally stored entry_price (reliable) instead of
-    Simmer's position API which can return 0 or be delayed.
+    Manage live positions using local entry record.
+    Uses locally stored entry_price (reliable) instead of
+    Simmer position API which can return 0 or be delayed.
     """
     entry_record = _load_entry_record(skill_file)
 
     if entry_record and _entry_record_is_expired(entry_record):
-        print(f"⏰ Entry record expired (market ended), clearing.", flush=True)
+        print("⏰ Entry record expired, clearing.", flush=True)
         _clear_entry_record(skill_file)
         return []
 
     if not entry_record:
         return []
 
-    # Extract from LOCAL record - RELIABLE values
     entry_price = float(entry_record["entry_price"])
     entry_cost = float(entry_record["entry_cost"])
     side = entry_record["side"]
@@ -1417,18 +1662,31 @@ def manage_live_positions_v2(skill_file, log):
     question = entry_record["question"]
     shares = float(entry_record.get("shares", 0))
     clob_tokens = entry_record.get("clob_token_ids", [])
-    target_price = float(entry_record.get("target_price", entry_price * (1 + TAKE_PROFIT_PCT)))
-    stop_price = float(entry_record.get("stop_price", entry_price * (1 - STOP_LOSS_PCT)))
+    target_price = float(
+        entry_record.get(
+            "target_price",
+            entry_price * (1 + TAKE_PROFIT_PCT)
+        )
+    )
+    stop_price = float(
+        entry_record.get(
+            "stop_price",
+            entry_price * (1 - STOP_LOSS_PCT)
+        )
+    )
 
     end_str = entry_record.get("end_time")
     end_time = _parse_resolves_at(end_str) if end_str else None
 
     if entry_price <= 0 or shares <= 0:
-        print(f"⚠️ Invalid entry record (price={entry_price}, shares={shares}), clearing.", flush=True)
+        print(
+            f"⚠️ Invalid entry record "
+            f"(price={entry_price}, shares={shares}), clearing.",
+            flush=True
+        )
         _clear_entry_record(skill_file)
         return []
 
-    # Get current CLOB price for our side
     current_price = None
     price_source = "unavailable"
 
@@ -1444,62 +1702,107 @@ def manage_live_positions_v2(skill_file, log):
         if current_price is None:
             yes_mid = fetch_live_prices(clob_tokens)
             if yes_mid is not None:
-                current_price = yes_mid if side == "yes" else (1.0 - yes_mid)
+                current_price = (
+                    yes_mid if side == "yes" else (1.0 - yes_mid)
+                )
                 price_source = "yes_mid_derived"
 
     if current_price is None:
-        print(f"⚠️ Cannot get current price for {side.upper()} position, skipping exit check.", flush=True)
+        print(
+            f"⚠️ Cannot get current price for "
+            f"{side.upper()} position, skipping exit check.",
+            flush=True
+        )
         return []
 
     now = datetime.now(timezone.utc)
-    seconds_left = (end_time - now).total_seconds() if end_time else None
+    seconds_left = (
+        (end_time - now).total_seconds() if end_time else None
+    )
     entry_time_str = entry_record.get("ts")
     entry_time = _parse_resolves_at(entry_time_str)
-    hold_seconds = (now - entry_time).total_seconds() if entry_time else None
+    hold_seconds = (
+        (now - entry_time).total_seconds() if entry_time else None
+    )
     est_pnl = shares * (current_price - entry_price)
-    pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+    pnl_pct = (
+        (current_price - entry_price) / entry_price * 100
+        if entry_price > 0 else 0
+    )
 
-    print(f"📊 POSITION STATUS: {side.upper()} | "
-          f"entry ${entry_price:.3f} | now ${current_price:.3f} ({pnl_pct:+.1f}%) | "
-          f"TP ${target_price:.3f} | SL ${stop_price:.3f} | "
-          f"{f'{seconds_left:.0f}s left' if seconds_left else 'no expiry'} | "
-          f"est P&L ${est_pnl:.3f}", flush=True)
+    print(
+        f"📊 POSITION: {side.upper()} | "
+        f"entry ${entry_price:.3f} | "
+        f"now ${current_price:.3f} ({pnl_pct:+.1f}%) | "
+        f"TP ${target_price:.3f} | SL ${stop_price:.3f} | "
+        f"{f'{seconds_left:.0f}s left' if seconds_left else 'no expiry'} | "
+        f"est P&L ${est_pnl:.3f}",
+        flush=True
+    )
 
-    # Determine exit reason
     reason = None
     if current_price >= target_price:
         reason = "take_profit"
-        print(f"🎯 TAKE PROFIT triggered! ${current_price:.3f} >= ${target_price:.3f}", flush=True)
+        print(
+            f"🎯 TAKE PROFIT: "
+            f"${current_price:.3f} >= ${target_price:.3f}",
+            flush=True
+        )
     elif current_price <= stop_price:
         reason = "stop_loss"
-        print(f"🛑 STOP LOSS triggered! ${current_price:.3f} <= ${stop_price:.3f}", flush=True)
-    elif seconds_left is not None and seconds_left <= LIVE_TIME_STOP_SECONDS and est_pnl < 0:
+        print(
+            f"🛑 STOP LOSS: "
+            f"${current_price:.3f} <= ${stop_price:.3f}",
+            flush=True
+        )
+    elif (seconds_left is not None and
+          seconds_left <= LIVE_TIME_STOP_SECONDS and
+          est_pnl < 0):
         reason = "time_exit_losing"
-        print(f"⏰ TIME EXIT (losing): {seconds_left:.0f}s left, P&L ${est_pnl:.3f}", flush=True)
-    elif seconds_left is not None and seconds_left <= RESOLUTION_EXIT_SECONDS:
+        print(
+            f"⏰ TIME EXIT (losing): "
+            f"{seconds_left:.0f}s left, P&L ${est_pnl:.3f}",
+            flush=True
+        )
+    elif (seconds_left is not None and
+          seconds_left <= RESOLUTION_EXIT_SECONDS):
         reason = "pre_expiry_exit"
-        print(f"⏰ PRE-EXPIRY EXIT: {seconds_left:.0f}s left", flush=True)
-    elif hold_seconds is not None and hold_seconds >= LIVE_MAX_HOLD_SECONDS and est_pnl < 0:
+        print(
+            f"⏰ PRE-EXPIRY EXIT: {seconds_left:.0f}s left",
+            flush=True
+        )
+    elif (hold_seconds is not None and
+          hold_seconds >= LIVE_MAX_HOLD_SECONDS and
+          est_pnl < 0):
         reason = "max_hold_exit"
-        print(f"⏰ MAX HOLD EXIT: held {hold_seconds:.0f}s, P&L ${est_pnl:.3f}", flush=True)
+        print(
+            f"⏰ MAX HOLD EXIT: "
+            f"held {hold_seconds:.0f}s, P&L ${est_pnl:.3f}",
+            flush=True
+        )
 
     if not reason:
         return []
 
-    # Check minimum exit notional
     exit_notional = shares * current_price
     if exit_notional < 1.0:
-        print(f"⏸️ Exit deferred ({reason}): notional ${exit_notional:.2f} < $1 minimum. "
-              f"Holding {shares:.4f} {side.upper()} @ ${current_price:.3f}", flush=True)
+        print(
+            f"⏸️ Exit deferred ({reason}): "
+            f"notional ${exit_notional:.2f} < $1 minimum.",
+            flush=True
+        )
         if seconds_left is not None and seconds_left <= 10:
-            print(f"⏰ Market expiring imminently, clearing entry record.", flush=True)
+            print("⏰ Market expiring, clearing record.", flush=True)
             _clear_entry_record(skill_file)
         return []
 
-    # Execute exit
-    print(f"🔄 EXECUTING EXIT: {reason} | {side.upper()} {shares:.4f} shares | "
-          f"entry ${entry_price:.3f} -> now ${current_price:.3f} ({price_source}) | "
-          f"est P&L ${est_pnl:.2f}", flush=True)
+    print(
+        f"🔄 EXECUTING EXIT: {reason} | "
+        f"{side.upper()} {shares:.4f} shares | "
+        f"entry ${entry_price:.3f} -> now ${current_price:.3f} "
+        f"({price_source}) | est P&L ${est_pnl:.2f}",
+        flush=True
+    )
 
     result = execute_trade(market_id, side, shares=shares, action="sell")
 
@@ -1510,8 +1813,11 @@ def manage_live_positions_v2(skill_file, log):
         avg_exit = (proceeds / shares) if shares > 0 else current_price
         realized = shares * (avg_exit - entry_price)
 
-        print(f"✅ EXIT SUCCESSFUL: Sold {shares:.2f} {side.upper()} @ ${avg_exit:.3f} | "
-              f"P&L ${realized:.2f} | reason: {reason}", flush=True)
+        print(
+            f"✅ EXIT OK: Sold {shares:.2f} {side.upper()} "
+            f"@ ${avg_exit:.3f} | P&L ${realized:.2f} | {reason}",
+            flush=True
+        )
 
         _append_live_trade_event(skill_file, {
             "type": "exit",
@@ -1542,20 +1848,36 @@ def manage_live_positions_v2(skill_file, log):
         }]
 
     else:
-        err = result.get("error", "Unknown error") if result else "No response"
-
-        # Retry with slightly fewer shares for insufficient shares error
-        if "insufficient" in str(err).lower() or "Insufficient" in str(err):
-            print(f"⚠️ Insufficient shares error, retrying with 90% of shares...", flush=True)
+        err = (
+            result.get("error", "Unknown") if result else "No response"
+        )
+        if "insufficient" in str(err).lower():
+            print(
+                f"⚠️ Insufficient shares, retrying with 90%...",
+                flush=True
+            )
             retry_shares = round(shares * 0.9, 4)
             if retry_shares * current_price >= 1.0:
-                retry = execute_trade(market_id, side, shares=retry_shares, action="sell")
+                retry = execute_trade(
+                    market_id, side,
+                    shares=retry_shares, action="sell"
+                )
                 if retry and retry.get("success"):
-                    proceeds = float(retry.get("cost") or retry_shares * current_price)
-                    avg_exit = (proceeds / retry_shares) if retry_shares > 0 else current_price
+                    proceeds = float(
+                        retry.get("cost") or
+                        retry_shares * current_price
+                    )
+                    avg_exit = (
+                        (proceeds / retry_shares)
+                        if retry_shares > 0 else current_price
+                    )
                     realized = retry_shares * (avg_exit - entry_price)
-                    print(f"✅ RETRY EXIT: Sold {retry_shares:.2f} {side.upper()} @ ${avg_exit:.3f} | "
-                          f"P&L ${realized:.2f}", flush=True)
+                    print(
+                        f"✅ RETRY EXIT OK: "
+                        f"Sold {retry_shares:.2f} {side.upper()} "
+                        f"@ ${avg_exit:.3f} | P&L ${realized:.2f}",
+                        flush=True
+                    )
                     _clear_entry_record(skill_file)
                     return [{
                         "market_id": market_id,
@@ -1578,10 +1900,15 @@ def _estimate_live_open_exposure(positions):
     exposure = 0.0
     count = 0
     for pos in positions or []:
-        held = float(pos.get("shares_yes", 0) or 0) + float(pos.get("shares_no", 0) or 0)
+        held = (
+            float(pos.get("shares_yes", 0) or 0) +
+            float(pos.get("shares_no", 0) or 0)
+        )
         if held <= 0:
             continue
-        if "up or down" not in (pos.get("question", "") or "").lower():
+        if "up or down" not in (
+            pos.get("question", "") or ""
+        ).lower():
             continue
         count += 1
         exposure += float(
@@ -1597,22 +1924,32 @@ def _get_live_pnl_snapshot(skill_file):
     """Return live P&L info from portfolio."""
     try:
         portfolio = get_portfolio()
-        if not portfolio or (isinstance(portfolio, dict) and portfolio.get("error")):
+        if not portfolio or (
+            isinstance(portfolio, dict) and portfolio.get("error")
+        ):
             return {"pnl_total": None, "pnl_24h_effective": None}
 
         def _to_float(obj, *keys):
             for key in keys:
                 try:
-                    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+                    val = (
+                        obj.get(key) if isinstance(obj, dict)
+                        else getattr(obj, key, None)
+                    )
                     if val is not None:
                         return float(val)
                 except Exception:
                     pass
             return None
 
-        pnl_total = _to_float(portfolio, "pnl_total", "total_pnl", "realized_pnl")
+        pnl_total = _to_float(
+            portfolio, "pnl_total", "total_pnl", "realized_pnl"
+        )
         pnl_24h = _to_float(portfolio, "pnl_24h")
-        return {"pnl_total": pnl_total, "pnl_24h_effective": pnl_24h}
+        return {
+            "pnl_total": pnl_total,
+            "pnl_24h_effective": pnl_24h
+        }
     except Exception as e:
         print(f"⚠️ PnL snapshot error: {e}", flush=True)
         return {"pnl_total": None, "pnl_24h_effective": None}
@@ -1622,8 +1959,10 @@ def _get_live_pnl_snapshot(skill_file):
 # Main Strategy Logic
 # =============================================================================
 
-def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
-                              smart_sizing=False, quiet=False):
+def run_fast_market_strategy(
+    dry_run=True, positions_only=False, show_config=False,
+    smart_sizing=False, quiet=False
+):
     """Run one cycle of the fast market trading strategy."""
 
     def log(msg, force=False):
@@ -1634,25 +1973,27 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"{'='*60}")
 
     if dry_run:
-        log("  [PAPER MODE] Use --live for real trades.")
+        log("  MODE: PAPER (use --live for real trades)")
+    else:
+        log("  MODE: LIVE")
 
-    log(f"\n⚙️  Config: {ASSET}/{WINDOW} | "
-        f"max ${MAX_POSITION_USD:.2f} | "
-        f"TP {TAKE_PROFIT_PCT:.0%} / SL {STOP_LOSS_PCT:.0%} | "
-        f"threshold {ENTRY_THRESHOLD} | "
-        f"momentum {MIN_MOMENTUM_PCT}% | "
-        f"score {ENTRY_SCORE_THRESHOLD:.2f}")
-
-    # Initialize client
     get_client(live=not dry_run)
 
-    # Load state
     live_spend = _load_daily_spend(__file__)
     paper_state = _load_paper_state(__file__)
 
     if show_config:
         config_path = get_config_path(__file__)
         log(f"\n  Config file: {config_path}")
+        log(f"\n  Current settings:")
+        log(f"    entry_threshold:      {ENTRY_THRESHOLD}")
+        log(f"    min_momentum_pct:     {MIN_MOMENTUM_PCT}%")
+        log(f"    entry_score_thresh:   {ENTRY_SCORE_THRESHOLD}")
+        log(f"    max_position:         ${MAX_POSITION_USD:.2f}")
+        log(f"    take_profit_pct:      {TAKE_PROFIT_PCT:.0%}")
+        log(f"    stop_loss_pct:        {STOP_LOSS_PCT:.0%}")
+        log(f"    lookback_minutes:     {LOOKBACK_MINUTES}")
+        log(f"    min_time_remaining:   {MIN_TIME_REMAINING}s")
         return
 
     # Auto-redeem resolved positions (live only)
@@ -1663,71 +2004,110 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             try:
                 redeem_results = get_client().auto_redeem()
                 _last_auto_redeem_ts = now_redeem_ts
-                redeemed = [r for r in (redeem_results or []) if isinstance(r, dict) and r.get("success")]
+                redeemed = [
+                    r for r in (redeem_results or [])
+                    if isinstance(r, dict) and r.get("success")
+                ]
                 if redeemed:
-                    log(f"✅ Auto-redeemed {len(redeemed)} resolved position(s).")
+                    log(
+                        f"✅ Auto-redeemed "
+                        f"{len(redeemed)} resolved position(s)."
+                    )
             except Exception as e:
                 _last_auto_redeem_ts = now_redeem_ts
                 log(f"⚠️ Auto-redeem skipped: {e}")
 
-    # Manage exits FIRST
+    # Manage exits first
     paper_state, closed_paper = manage_paper_positions(__file__, log)
     closed_live = []
     if not dry_run:
         closed_live = manage_live_positions_v2(__file__, log)
 
-    # Show positions if requested
     if positions_only:
         log("\n📊 Current Positions:")
         entry = _load_entry_record(__file__)
         if entry:
             log(f"  LIVE: {entry['question'][:60]}")
-            log(f"    {entry['side'].upper()} @ ${entry['entry_price']:.3f} | "
+            log(
+                f"    {entry['side'].upper()} @ "
+                f"${entry['entry_price']:.3f} | "
                 f"shares: {entry['shares']:.2f} | "
-                f"TP: ${entry['target_price']:.3f} | SL: ${entry['stop_price']:.3f}")
+                f"TP: ${entry['target_price']:.3f} | "
+                f"SL: ${entry['stop_price']:.3f}"
+            )
         else:
             positions = get_positions()
-            fast_pos = [p for p in positions if "up or down" in (p.get("question", "") or "").lower()]
+            fast_pos = [
+                p for p in positions
+                if "up or down" in (
+                    p.get("question", "") or ""
+                ).lower()
+            ]
             if not fast_pos and not paper_state.get("open_positions"):
                 log("  No open fast market positions")
             for pos in fast_pos:
                 log(f"  • {pos.get('question', 'Unknown')[:60]}")
+            for pos in paper_state.get("open_positions", []):
+                log(
+                    f"  [PAPER] • "
+                    f"{pos.get('question', 'Unknown')[:60]}"
+                )
         return
 
-    # SINGLE POSITION MODE: If position active, skip new entry scan
+    # Single position mode: skip scan if position is active
     if not dry_run and SINGLE_POSITION_LIVE_MODE:
         if _has_active_entry_record(__file__):
-            log(f"🎯 Position-focus mode: active entry exists, skipping new scan.")
+            log("🎯 Position-focus mode: active entry, skipping scan.")
             return
         live_positions = get_positions()
-        fast_positions = [p for p in live_positions
-                         if "up or down" in (p.get("question", "") or "").lower()]
+        fast_positions = [
+            p for p in live_positions
+            if "up or down" in (p.get("question", "") or "").lower()
+        ]
         if fast_positions:
-            log(f"🎯 Found {len(fast_positions)} open position(s), skipping new scan.")
+            log(
+                f"🎯 Found {len(fast_positions)} open position(s), "
+                f"skipping scan."
+            )
             return
 
-    # Check loss guard pause
+    # Loss guard pause
     guard_state, pause_remaining = _guard_pause_remaining(__file__)
     if pause_remaining > 0:
-        log(f"⏸️  Loss-stop pause: {pause_remaining}s remaining "
-            f"(reason: {guard_state.get('reason', 'loss_stop')})")
+        log(
+            f"⏸️ Loss-stop pause: {pause_remaining}s remaining "
+            f"(reason: {guard_state.get('reason', 'loss_stop')})"
+        )
         return
 
-    # Check daily loss limits
+    # Daily loss limits
     if dry_run:
         if paper_state["realized_pnl"] <= -abs(DAILY_LOSS_LIMIT):
-            _activate_loss_pause(__file__, paper_state["realized_pnl"], "paper_daily_loss")
-            log(f"🔴 Paper loss limit reached (${paper_state['realized_pnl']:.2f}). Pausing.")
+            _activate_loss_pause(
+                __file__,
+                paper_state["realized_pnl"],
+                "paper_daily_loss"
+            )
+            log(
+                f"🔴 Paper loss limit reached "
+                f"(${paper_state['realized_pnl']:.2f}). Pausing."
+            )
             return
     else:
         live_pnl = _get_live_pnl_snapshot(__file__)
         live_pnl_24h = live_pnl.get("pnl_24h_effective")
-        if live_pnl_24h is not None and live_pnl_24h <= -abs(DAILY_LOSS_LIMIT):
-            _activate_loss_pause(__file__, live_pnl_24h, "live_daily_loss")
-            log(f"🔴 Live loss limit reached (${live_pnl_24h:.2f}). Pausing.")
+        if (live_pnl_24h is not None and
+                live_pnl_24h <= -abs(DAILY_LOSS_LIMIT)):
+            _activate_loss_pause(
+                __file__, live_pnl_24h, "live_daily_loss"
+            )
+            log(
+                f"🔴 Live loss limit reached "
+                f"(${live_pnl_24h:.2f}). Pausing."
+            )
             return
 
-   # =========================================================================
+    # =========================================================================
     # STEP 1: Discover markets
     # =========================================================================
     log(f"\n🔍 Discovering {ASSET} fast markets...")
@@ -1735,11 +2115,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Found {len(markets)} active fast markets")
 
     if not markets:
-        log("  No active fast markets found - may be outside market hours")
+        log("  No markets found - may be outside market hours")
         return
 
-    # Look up fee rate from sample token
-    sample = next((m for m in markets if m.get("clob_token_ids")), None)
+    # Look up fee rate
+    sample = next(
+        (m for m in markets if m.get("clob_token_ids")), None
+    )
     if sample and sample.get("fee_rate_bps", 0) == 0:
         fee = _lookup_fee_rate(sample["clob_token_ids"][0])
         if fee > 0:
@@ -1748,32 +2130,28 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 m["fee_rate_bps"] = fee
 
     # =========================================================================
-    # STEP 2: Find best market to trade
+    # STEP 2: Find best market
     # =========================================================================
     best = find_best_fast_market(markets)
     if not best:
-        now = datetime.now(timezone.utc)
-        for m in markets:
-            if m.get("is_live_now") is False:
-                log(f"  Skipped: {m['question'][:50]}... (not live yet)")
-            elif m.get("end_time"):
-                secs = (m["end_time"] - now).total_seconds()
-                log(f"  Skipped: {m['question'][:50]}... ({secs:.0f}s left < {MIN_TIME_REMAINING}s min)")
-        log(f"  No tradeable markets right now - waiting for next window")
+        log("  No tradeable markets right now - waiting for next window")
         return
 
     end_time = best.get("end_time")
-    remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
+    remaining = (
+        (end_time - datetime.now(timezone.utc)).total_seconds()
+        if end_time else 0
+    )
 
     log(f"\n🎯 Selected: {best['question']}")
     log(f"  Expires in: {remaining:.0f}s")
-    log(f"  Source: {best.get('source', 'unknown')}")
     log(f"  Market ID: {best.get('market_id', 'none')}")
+    log(f"  Source: {best.get('source', 'unknown')}")
 
     # Check cooldown
     cooldowns = _load_bad_markets(__file__)
     if _cooldown_is_active(cooldowns, best):
-        log(f"  Market on cooldown - skip")
+        log("  ⛔ Market on cooldown - skip")
         return
 
     # =========================================================================
@@ -1781,98 +2159,130 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # =========================================================================
     clob_tokens = best.get("clob_token_ids", [])
     log(f"\n  Fetching live CLOB price...")
-    log(f"  CLOB tokens: {clob_tokens}")
+    log(f"  CLOB tokens available: {len(clob_tokens)}")
 
     live_price = fetch_live_prices(clob_tokens) if clob_tokens else None
 
     if live_price is None:
-        log(f"  Cannot fetch live CLOB price - skipping (unsafe for fast markets)")
+        log("  ⛔ Cannot fetch CLOB price - skip (unsafe for fast mkts)")
         _set_market_cooldown(__file__, best)
         return
 
     market_yes_price = live_price
-    log(f"  Current YES price: ${market_yes_price:.3f} (live CLOB)")
+    log(f"  Current YES price: ${market_yes_price:.4f}")
 
     # =========================================================================
-    # STEP 4: Get CEX momentum signal
+    # STEP 4: Get CEX momentum
     # =========================================================================
-    log(f"\n  Fetching {ASSET} momentum from Coinbase...")
+    log(f"\n  Fetching {ASSET} momentum ({LOOKBACK_MINUTES} candles)...")
     momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
     if not momentum:
-        log(f"  Failed to fetch price data from Coinbase")
+        log("  ⛔ Failed to fetch momentum data")
         return
 
     # =========================================================================
-    # STEP 5: Find trade signal (mean reversion logic)
+    # STEP 5: Find trade signal
     # =========================================================================
     log(f"\n  Analyzing CEX/CLOB divergence...")
-    side, divergence, skip_reason = _find_trade_signal(momentum, market_yes_price, remaining)
+    side, divergence, skip_reason = _find_trade_signal(
+        momentum, market_yes_price, remaining
+    )
 
     if side is None:
-        log(f"  No signal: {skip_reason}")
+        log(f"  ⛔ No signal this cycle: {skip_reason}")
         return
 
-    log(f"  Signal found: {side.upper()} | divergence: {divergence:.3f}")
+    log(f"  ✅ Signal: {side.upper()} | divergence: {divergence:.4f}")
 
-    # Check minimum momentum
-    momentum_pct = abs(momentum["momentum_pct"])
-    if momentum_pct < MIN_MOMENTUM_PCT:
-        log(f"  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% - skip")
-        return
-
-    # Check spread
-    pre_spread = best.get("spread_cents")
+    # =========================================================================
+    # STEP 6: Spread check
+    # =========================================================================
     book = None
+    pre_spread = best.get("spread_cents")
 
     if pre_spread is not None:
         mid_estimate = market_yes_price if market_yes_price > 0 else 0.5
         spread_pct = (pre_spread / 100.0) / mid_estimate
-        log(f"  Spread: {pre_spread:.1f} cents ({best.get('liquidity_tier', 'unknown')})")
+        log(
+            f"\n  Spread: {pre_spread:.1f} cents "
+            f"({best.get('liquidity_tier', 'unknown')})"
+        )
         if spread_pct > MAX_SPREAD_PCT:
-            log(f"  Spread {spread_pct:.1%} > max {MAX_SPREAD_PCT:.1%} - skip")
+            log(
+                f"  ⛔ Spread {spread_pct:.1%} > "
+                f"max {MAX_SPREAD_PCT:.1%} - skip"
+            )
             return
     else:
         book = fetch_orderbook_summary(clob_tokens) if clob_tokens else None
         if book:
-            log(f"  Spread: {book['spread_pct']:.1%} "
-                f"(bid ${book['best_bid']:.3f} / ask ${book['best_ask']:.3f})")
-            log(f"  Depth: ${book['bid_depth_usd']:.0f} bid / ${book['ask_depth_usd']:.0f} ask")
+            log(
+                f"\n  Spread: {book['spread_pct']:.1%} "
+                f"(bid ${book['best_bid']:.3f} / "
+                f"ask ${book['best_ask']:.3f})"
+            )
+            log(
+                f"  Depth: ${book['bid_depth_usd']:.0f} bid / "
+                f"${book['ask_depth_usd']:.0f} ask"
+            )
             if book["spread_pct"] > MAX_SPREAD_PCT:
-                log(f"  Spread too wide - skip")
+                log(
+                    f"  ⛔ Spread {book['spread_pct']:.1%} too wide - skip"
+                )
                 _set_market_cooldown(__file__, best)
                 return
         else:
-            log(f"  Could not fetch order book - skip")
+            log("  ⛔ Could not fetch order book - skip")
             _set_market_cooldown(__file__, best)
             return
 
-    # Entry price calculation
-    buy_price_mid = market_yes_price if side == "yes" else (1.0 - market_yes_price)
-    effective_fee_rate = POLY_FEE_RATE * (buy_price_mid * (1 - buy_price_mid)) ** POLY_FEE_EXPONENT
+    # =========================================================================
+    # STEP 7: Entry price calculation and guards
+    # =========================================================================
+    buy_price_mid = (
+        market_yes_price if side == "yes"
+        else (1.0 - market_yes_price)
+    )
+    effective_fee_rate = (
+        POLY_FEE_RATE *
+        (buy_price_mid * (1 - buy_price_mid)) ** POLY_FEE_EXPONENT
+    )
     fee_per_share = buy_price_mid * effective_fee_rate
     min_divergence = fee_per_share * 2 + ENTRY_THRESHOLD
 
-    # Get side-specific book for slippage
-    side_book = fetch_side_orderbook_summary(clob_tokens, side=side) if clob_tokens else None
+    side_book = (
+        fetch_side_orderbook_summary(clob_tokens, side=side)
+        if clob_tokens else None
+    )
     price = buy_price_mid
     if side_book and side_book.get("best_ask") is not None:
         price = float(side_book["best_ask"] or price)
 
-    # Entry price guards
+    log(f"\n  Entry price: ${price:.4f}")
+    log(f"  Buy price mid: ${buy_price_mid:.4f}")
+    log(f"  Fee per share: ${fee_per_share:.5f}")
+    log(f"  Min divergence needed: {min_divergence:.4f}")
+
     if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
-        log(f"  Entry price ${price:.3f} outside allowed range - skip")
+        log(
+            f"  ⛔ Price ${price:.3f} outside range "
+            f"[${MIN_ENTRY_PRICE:.2f}, ${MAX_ENTRY_PRICE:.2f}] - skip"
+        )
         return
 
     if not dry_run and price < MIN_LIVE_ENTRY_PRICE:
-        log(f"  Live entry price ${price:.3f} below minimum ${MIN_LIVE_ENTRY_PRICE:.2f} - skip")
+        log(
+            f"  ⛔ Live price ${price:.3f} below "
+            f"minimum ${MIN_LIVE_ENTRY_PRICE:.2f} - skip"
+        )
         return
 
-    if price >= MOMENTUM_MAX_ENTRY:
-        log(f"  Entry price ${price:.3f} >= max allowed ${MOMENTUM_MAX_ENTRY:.2f} - skip")
-        return
+    log(f"  ✅ Entry price ${price:.3f} accepted")
 
-    # Multi-factor score
+    # =========================================================================
+    # STEP 8: Multi-factor score
+    # =========================================================================
     score, score_details = _score_entry_setup(
         side=side,
         momentum=momentum,
@@ -1884,8 +2294,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         side_price=buy_price_mid,
     )
 
-    log(f"\n  Entry Score: {score:.3f} / {ENTRY_SCORE_THRESHOLD:.3f} threshold")
-    log(f"  Score breakdown:")
+    log(f"\n  Entry Score: {score:.3f} / {ENTRY_SCORE_THRESHOLD:.3f}")
+    log(f"  Breakdown:")
     log(f"    momentum:     {score_details['momentum']:.3f}")
     log(f"    acceleration: {score_details['acceleration']:.3f}")
     log(f"    spread:       {score_details['spread']:.3f}")
@@ -1896,21 +2306,27 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"    slippage:     {score_details['slippage']:.3f}")
 
     if score_details["edge"] <= 0:
-        log(f"  Edge too weak after fees - skip")
+        log("  ⛔ Edge zero or negative after fees - skip")
         return
 
     if score < ENTRY_SCORE_THRESHOLD:
-        log(f"  Score {score:.3f} below threshold {ENTRY_SCORE_THRESHOLD:.3f} - skip")
+        log(
+            f"  ⛔ Score {score:.3f} below "
+            f"threshold {ENTRY_SCORE_THRESHOLD:.3f} - skip"
+        )
         return
 
-     # =========================================================================
-    # STEP 6: Position sizing and exposure check
+    log(f"  ✅ Score {score:.3f} passes threshold")
+
+    # =========================================================================
+    # STEP 9: Position sizing
     # =========================================================================
     position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
 
     if dry_run:
         current_open_exposure = sum(
-            float(p.get("entry_cost", 0)) for p in paper_state.get("open_positions", [])
+            float(p.get("entry_cost", 0))
+            for p in paper_state.get("open_positions", [])
         )
     else:
         live_positions = get_positions()
@@ -1919,7 +2335,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     remaining_exposure = MAX_OPEN_EXPOSURE - current_open_exposure
     if remaining_exposure <= 0:
-        log(f"  Exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) - skip")
+        log(
+            f"  ⛔ Exposure cap reached "
+            f"(${current_open_exposure:.2f}/"
+            f"${MAX_OPEN_EXPOSURE:.2f}) - skip"
+        )
         return
 
     if position_size > remaining_exposure:
@@ -1927,62 +2347,75 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  Position capped at ${position_size:.2f} (exposure limit)")
 
     if position_size < 0.50:
-        log(f"  Position ${position_size:.2f} too small - skip")
+        log(f"  ⛔ Position ${position_size:.2f} too small - skip")
         return
 
-    # Minimum shares check
     if price > 0:
         min_cost = MIN_SHARES_PER_ORDER * price
         if min_cost > position_size:
-            log(f"  Position ${position_size:.2f} too small for "
-                f"{MIN_SHARES_PER_ORDER} shares at ${price:.3f} - skip")
+            log(
+                f"  ⛔ Position ${position_size:.2f} too small for "
+                f"{MIN_SHARES_PER_ORDER} shares @ ${price:.3f} - skip"
+            )
             return
 
     # =========================================================================
-    # STEP 7: Signal confirmed - log it
+    # STEP 10: Execute trade
     # =========================================================================
+    implied_yes_display = 0.50 + (momentum["momentum_pct"] / 100.0) * 15.0
     trade_rationale = (
-        f"BTC {momentum['momentum_pct']:+.3f}% | "
-        f"implied YES ${0.50 + (momentum['momentum_pct']/100.0)*15:.3f} | "
+        f"BTC {momentum['momentum_pct']:+.4f}% | "
+        f"implied YES ${implied_yes_display:.3f} | "
         f"actual YES ${market_yes_price:.3f} | "
-        f"divergence {divergence:.3f}"
+        f"divergence {divergence:.4f}"
     )
 
     log(f"\n{'='*50}")
-    log(f"✅ TRADE SIGNAL: {side.upper()}")
-    log(f"   Rationale: {trade_rationale}")
-    log(f"   Entry price: ${price:.3f}")
-    log(f"   Position size: ${position_size:.2f}")
+    log(f"✅ TRADE SIGNAL CONFIRMED: {side.upper()}")
+    log(f"   {trade_rationale}")
+    log(f"   Entry: ${price:.4f}")
+    log(f"   Size:  ${position_size:.2f}")
     log(f"   Score: {score:.3f}")
-    log(f"   TP: ${round(price * (1 + TAKE_PROFIT_PCT), 3):.3f} | "
-        f"SL: ${round(max(0.001, price * (1 - STOP_LOSS_PCT)), 3):.3f}")
+    log(
+        f"   TP:    ${round(price * (1 + TAKE_PROFIT_PCT), 4):.4f} "
+        f"(+{TAKE_PROFIT_PCT:.0%})"
+    )
+    log(
+        f"   SL:    "
+        f"${round(max(0.001, price * (1 - STOP_LOSS_PCT)), 4):.4f} "
+        f"(-{STOP_LOSS_PCT:.0%})"
+    )
     log(f"{'='*50}")
 
-    # =========================================================================
-    # STEP 8: Get market ID (already have from Simmer, or import from Gamma)
-    # =========================================================================
+    # Get market ID
     if best.get("market_id"):
         market_id = best["market_id"]
         log(f"\n  Market ready: {market_id}")
     else:
-        log(f"\n  Importing market to Simmer...")
-        market_id, import_error = import_fast_market_market(best["slug"])
+        log("\n  Importing market to Simmer...")
+        market_id, import_error = import_fast_market_market(
+            best["slug"]
+        )
         if not market_id:
-            log(f"  Import failed: {import_error}")
+            log(f"  ❌ Import failed: {import_error}")
             return
-        log(f"  Market imported: {market_id}")
+        log(f"  ✅ Market imported: {market_id}")
 
-    # =========================================================================
-    # STEP 9: Execute trade
-    # =========================================================================
     tag = "PAPER" if dry_run else "LIVE"
-    log(f"\n  Executing {side.upper()} {tag} trade for ${position_size:.2f}...")
+    log(
+        f"\n  Executing {side.upper()} {tag} trade "
+        f"for ${position_size:.2f}..."
+    )
 
-    result = execute_trade(market_id, side, amount=position_size, action="buy")
+    result = execute_trade(
+        market_id, side, amount=position_size, action="buy"
+    )
 
     if result and result.get("success"):
-        # Get shares from trade result - most reliable source
-        shares = float(result.get("shares_bought") or result.get("shares") or 0)
+        shares = float(
+            result.get("shares_bought") or
+            result.get("shares") or 0
+        )
         actual_cost = float(result.get("cost") or position_size)
         trade_id = result.get("trade_id")
 
@@ -2005,11 +2438,15 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"{'='*50}")
 
         if result.get("simulated"):
-            # Paper trade tracking
-            target_price = round(fill_price * (1 + TAKE_PROFIT_PCT), 6)
-            stop_price_val = round(max(0.001, fill_price * (1 - STOP_LOSS_PCT)), 6)
-
-            paper_state["spent"] = round(float(paper_state.get("spent", 0.0)) + actual_cost, 6)
+            target_price_val = round(
+                fill_price * (1 + TAKE_PROFIT_PCT), 6
+            )
+            stop_price_val = round(
+                max(0.001, fill_price * (1 - STOP_LOSS_PCT)), 6
+            )
+            paper_state["spent"] = round(
+                float(paper_state.get("spent", 0.0)) + actual_cost, 6
+            )
             paper_state["trades"] = int(paper_state.get("trades", 0)) + 1
             paper_state.setdefault("open_positions", []).append({
                 "market_id": market_id,
@@ -2021,15 +2458,21 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 "entry_time": datetime.now(timezone.utc).isoformat(),
                 "end_time": end_time.isoformat() if end_time else None,
                 "clob_token_ids": clob_tokens,
-                "target_price": target_price,
+                "target_price": target_price_val,
                 "stop_price": stop_price_val,
-                "entry_fee_per_share": round(_estimate_fee_per_share(fill_price), 8),
+                "entry_fee_per_share": round(
+                    _estimate_fee_per_share(fill_price), 8
+                ),
             })
             _save_paper_state(__file__, paper_state)
-            log(f"  [PAPER] TP ${target_price:.3f} / SL ${stop_price_val:.3f} tracking active")
+            log(
+                f"  [PAPER] Tracking: "
+                f"TP ${target_price_val:.3f} / "
+                f"SL ${stop_price_val:.3f}"
+            )
 
         else:
-            # LIVE trade - save entry record immediately
+            # LIVE: save entry record immediately
             _save_entry_record(
                 __file__,
                 market_id=market_id,
@@ -2042,12 +2485,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 clob_token_ids=clob_tokens,
             )
 
-            # Update daily spend
-            live_spend["spent"] = round(live_spend.get("spent", 0.0) + actual_cost, 6)
+            live_spend["spent"] = round(
+                live_spend.get("spent", 0.0) + actual_cost, 6
+            )
             live_spend["trades"] = int(live_spend.get("trades", 0)) + 1
             _save_daily_spend(__file__, live_spend)
 
-            # Append to trade ledger
             _append_live_trade_event(__file__, {
                 "type": "entry",
                 "market_id": market_id,
@@ -2063,9 +2506,12 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 "score": round(score, 6),
             })
 
-            # Log to trade journal if available
             if trade_id and JOURNAL_AVAILABLE:
-                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                momentum_pct_abs = abs(momentum["momentum_pct"])
+                confidence = min(
+                    0.9,
+                    0.5 + divergence + (momentum_pct_abs / 100)
+                )
                 log_trade(
                     trade_id=trade_id,
                     source=TRADE_SOURCE,
@@ -2079,7 +2525,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 )
 
     else:
-        error = result.get("error", "Unknown error") if result else "No response"
+        error = (
+            result.get("error", "Unknown") if result else "No response"
+        )
         log(f"\n❌ TRADE FAILED: {error}")
 
         if os.environ.get("AUTOMATON_MANAGED"):
@@ -2094,7 +2542,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             _automaton_reported = True
         return
 
-    # Automaton report on success
     if os.environ.get("AUTOMATON_MANAGED"):
         total_trades = 1 if result and result.get("success") else 0
         amount = round(position_size, 2) if total_trades > 0 else 0
@@ -2113,65 +2560,111 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 # =============================================================================
 
 if __name__ == "__main__":
-    print("\n" + "="*60, flush=True)
-    print("FASTLOOP v2.1 - MAIN ENTRY POINT", flush=True)
+    print("\n" + "=" * 60, flush=True)
+    print("FASTLOOP v2.2 - MAIN ENTRY POINT", flush=True)
     print(f"Time: {_safe_et_timestamp()}", flush=True)
-    print("="*60 + "\n", flush=True)
+    print("=" * 60 + "\n", flush=True)
 
-    parser = argparse.ArgumentParser(description="Simmer FastLoop Trading Skill v2.1")
-    parser.add_argument("--live", action="store_true", help="Execute real trades")
-    parser.add_argument("--dry-run", action="store_true", help="Show opportunities without trading")
-    parser.add_argument("--positions", action="store_true", help="Show current positions")
-    parser.add_argument("--config", action="store_true", help="Show current config")
-    parser.add_argument("--set", action="append", metavar="KEY=VALUE", help="Update config")
-    parser.add_argument("--smart-sizing", action="store_true", help="Portfolio-based sizing")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Only output on trades/errors")
+    parser = argparse.ArgumentParser(
+        description="Simmer FastLoop Trading Skill v2.2"
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Execute real trades"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show opportunities without trading"
+    )
+    parser.add_argument(
+        "--positions", action="store_true",
+        help="Show current positions"
+    )
+    parser.add_argument(
+        "--config", action="store_true",
+        help="Show current config"
+    )
+    parser.add_argument(
+        "--set", action="append", metavar="KEY=VALUE",
+        help="Update config"
+    )
+    parser.add_argument(
+        "--smart-sizing", action="store_true",
+        help="Portfolio-based sizing"
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Only output on trades/errors"
+    )
 
     args = parser.parse_args()
-    print(f"Arguments: live={args.live} dry_run={args.dry_run} "
-          f"positions={args.positions} quiet={args.quiet}", flush=True)
+    print(
+        f"Arguments: live={args.live} dry_run={args.dry_run} "
+        f"positions={args.positions} quiet={args.quiet}",
+        flush=True
+    )
 
-    # Handle --set config updates
     if args.set:
         updates = {}
         for item in args.set:
             if "=" not in item:
-                print(f"Invalid --set format: {item}. Use KEY=VALUE", flush=True)
+                print(
+                    f"Invalid --set format: {item}. Use KEY=VALUE",
+                    flush=True
+                )
                 sys.exit(1)
             key, val = item.split("=", 1)
             if key in CONFIG_SCHEMA:
                 type_fn = CONFIG_SCHEMA[key].get("type", str)
                 try:
                     if type_fn == bool:
-                        updates[key] = val.lower() in ("true", "1", "yes")
+                        updates[key] = val.lower() in (
+                            "true", "1", "yes"
+                        )
                     else:
                         updates[key] = type_fn(val)
                 except ValueError:
-                    print(f"Invalid value for {key}: {val}", flush=True)
+                    print(
+                        f"Invalid value for {key}: {val}",
+                        flush=True
+                    )
                     sys.exit(1)
             else:
                 print(f"Unknown config key: {key}", flush=True)
-                print(f"Valid keys: {', '.join(CONFIG_SCHEMA.keys())}", flush=True)
+                print(
+                    f"Valid keys: {', '.join(CONFIG_SCHEMA.keys())}",
+                    flush=True
+                )
                 sys.exit(1)
         update_config(updates, __file__)
-        print(f"✅ Config updated: {json.dumps(updates)}", flush=True)
+        print(
+            f"✅ Config updated: {json.dumps(updates)}",
+            flush=True
+        )
         sys.exit(0)
 
     dry_run = not args.live
 
-    print(f"Mode: {'LIVE' if args.live else 'PAPER/DRY-RUN'}", flush=True)
-    print(f"Starting main loop...", flush=True)
+    print(
+        f"Mode: {'LIVE' if args.live else 'PAPER/DRY-RUN'}",
+        flush=True
+    )
+    print("Starting main loop...", flush=True)
 
     cycle_count = 0
 
     while True:
         cycle_count += 1
         print(f"\n{'='*60}", flush=True)
-        print(f"🔄 SCAN CYCLE #{cycle_count} | {_safe_et_timestamp()}", flush=True)
+        print(
+            f"🔄 SCAN CYCLE #{cycle_count} | {_safe_et_timestamp()}",
+            flush=True
+        )
         print(f"{'='*60}", flush=True)
 
         try:
             _tick_market_cooldowns(__file__)
+            _automaton_reported = False
 
             run_fast_market_strategy(
                 dry_run=dry_run,
@@ -2181,47 +2674,68 @@ if __name__ == "__main__":
                 quiet=args.quiet,
             )
 
-            # Automaton fallback report
-            if os.environ.get("AUTOMATON_MANAGED") and not _automaton_reported:
-                print(json.dumps({
-                    "automaton": {
-                        "signals": 0,
-                        "trades_attempted": 0,
-                        "trades_executed": 0,
-                        "skip_reason": "no_signal",
-                    }
-                }), flush=True)
-            _automaton_reported = False  # Reset for next cycle
+            if (os.environ.get("AUTOMATON_MANAGED") and
+                    not _automaton_reported):
+                print(
+                    json.dumps({
+                        "automaton": {
+                            "signals": 0,
+                            "trades_attempted": 0,
+                            "trades_executed": 0,
+                            "skip_reason": "no_signal",
+                        }
+                    }),
+                    flush=True
+                )
 
         except Exception as e:
-            print(f"❌ LOOP ERROR (cycle #{cycle_count}): {e}", flush=True)
+            print(
+                f"❌ LOOP ERROR (cycle #{cycle_count}): {e}",
+                flush=True
+            )
             import traceback
             traceback.print_exc()
 
-        # Heartbeat - no global needed, _last_heartbeat_ts is module level
+        # Heartbeat every 5 minutes
+        global _last_heartbeat_ts
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
             entry = _load_entry_record(__file__)
-            position_status = "NO POSITION"
             if entry:
                 position_status = (
-                    f"ACTIVE: {entry['side'].upper()} @ ${entry['entry_price']:.3f} | "
-                    f"TP ${entry['target_price']:.3f} | SL ${entry['stop_price']:.3f}"
+                    f"ACTIVE {entry['side'].upper()} | "
+                    f"entry ${entry['entry_price']:.3f} | "
+                    f"TP ${entry['target_price']:.3f} | "
+                    f"SL ${entry['stop_price']:.3f}"
                 )
-            print(f"\n❤️  HEARTBEAT | {_safe_et_timestamp()} | "
-                  f"Cycle #{cycle_count} | {position_status}", flush=True)
+            else:
+                position_status = "NO POSITION"
+            print(
+                f"\n❤️  HEARTBEAT | {_safe_et_timestamp()} | "
+                f"Cycle #{cycle_count} | {position_status}",
+                flush=True
+            )
 
         # Sleep interval
         entry_active = _has_active_entry_record(__file__)
         if not dry_run and entry_active:
-            sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS  # 3 seconds
-            print(f"  Position active - next check in {sleep_seconds}s", flush=True)
+            sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
+            print(
+                f"  Position active - next check in {sleep_seconds}s",
+                flush=True
+            )
         elif args.live:
-            sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS  # 15 seconds
-            print(f"  Next scan in {sleep_seconds}s", flush=True)
+            sleep_seconds = LIVE_SCAN_INTERVAL_SECONDS
+            print(
+                f"  Next scan in {sleep_seconds}s",
+                flush=True
+            )
         else:
-            sleep_seconds = SCAN_INTERVAL_SECONDS  # 30 seconds
-            print(f"  Next scan in {sleep_seconds}s", flush=True)
+            sleep_seconds = SCAN_INTERVAL_SECONDS
+            print(
+                f"  Next scan in {sleep_seconds}s",
+                flush=True
+            )
 
         time.sleep(sleep_seconds)
