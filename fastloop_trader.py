@@ -2697,7 +2697,6 @@ if __name__ == "__main__":
             traceback.print_exc()
 
         # Heartbeat every 5 minutes
-        global _last_heartbeat_ts
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
