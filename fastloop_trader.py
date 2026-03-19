@@ -2153,7 +2153,6 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     skip_reasons = []
 
     def note_skip(reason):
-        note_skip(reason)
         _record_skip_reason(reason)
     existing = [] if dry_run else get_positions()
     for pos in existing:
