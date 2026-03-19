@@ -33,6 +33,32 @@ def _safe_et_timestamp():
         return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
 
 
+def _record_skip_reason(reason):
+    global _skip_reason_counts
+    if not reason:
+        return
+    _skip_reason_counts[reason] = int(_skip_reason_counts.get(reason, 0)) + 1
+
+
+def _drain_skip_reason_counts():
+    global _skip_reason_counts
+    snapshot = dict(_skip_reason_counts)
+    _skip_reason_counts = {}
+    return snapshot
+
+
+def _format_skip_summary(counts, limit=5):
+    if not counts:
+        return "no trade yet | no recent skips"
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ", ".join(f"{reason}={count}" for reason, count in ordered[:limit])
+    extra = len(ordered) - limit
+    if extra > 0:
+        shown += f", +{extra} more"
+    return f"no trade yet | last 10m skips: {shown}"
+
+
+
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -102,6 +128,8 @@ MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
 MAX_SPREAD_PCT = 0.06     # Skip if CLOB bid-ask spread exceeds this
 MIN_ENTRY_PRICE = 0.05
 MIN_LIVE_ENTRY_PRICE = 0.12
+SIGNAL_DEAD_ZONE = 0.02
+MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
@@ -116,6 +144,7 @@ HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 _last_heartbeat_ts = 0
 _last_auto_redeem_ts = 0
+_skip_reason_counts = {}
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -1748,7 +1777,7 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
     acceleration_score = _clamp01(0.55 * _clamp01(recent_pct / 0.08) * recent_aligned + 0.45 * _clamp01(aligned_accel / 0.06))
 
     spread_score = _clamp01(1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6)))
-    volume_score = _clamp01((volume_ratio - 0.40) / 1.60)
+    volume_score = _clamp01((volume_ratio - MIN_VOLUME_RATIO) / 1.40)
 
     imbalance_score = 0.45
     if side_book:
@@ -1938,6 +1967,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Window:           {WINDOW}")
     log(f"  Entry threshold:  {ENTRY_THRESHOLD} (min divergence from 50¢)")
     log(f"  Entry score min:  {ENTRY_SCORE_THRESHOLD:.2f} (multi-factor score threshold)")
+    log(f"  Signal dead zone: ±${SIGNAL_DEAD_ZONE:.2f} divergence | min vol {MIN_VOLUME_RATIO:.2f}x")
     log(f"  Min momentum:     {MIN_MOMENTUM_PCT}% (min price move)")
     log(f"  Max position:     ${MAX_POSITION_USD:.2f}")
     log(f"  Signal source:    {SIGNAL_SOURCE}")
@@ -2087,6 +2117,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                     m["fee_rate_bps"] = fee
 
     if not markets:
+        note_skip("no markets available")
         log("  No active fast markets found — may be outside market hours or wrong asset/window")
         log(f"  Check: asset={ASSET}, window={WINDOW}")
         if not quiet and not ACTION_ONLY_LOGS:
@@ -2105,6 +2136,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             elif end_time:
                 secs_left = (end_time - now).total_seconds()
                 log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
+        note_skip("no live tradeable market")
         log(f"  No live tradeable markets among {len(markets)} found — waiting for next window")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No tradeable markets (0/{len(markets)} live with enough time)")
@@ -2119,6 +2151,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     _mid = best.get("market_id") or ""
     _q = best.get("question", "").lower()
     skip_reasons = []
+
+    def note_skip(reason):
+        note_skip(reason)
+        _record_skip_reason(reason)
     existing = [] if dry_run else get_positions()
     for pos in existing:
         held = (pos.get("shares_yes") or 0) + (pos.get("shares_no") or 0)
@@ -2128,21 +2164,21 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"  ⏸️  Already holding position on this market — skip (dedup)")
             if not quiet and not ACTION_ONLY_LOGS:
                 print(f"📊 Summary: No trade (already holding this market)")
-            skip_reasons.append("already holding")
+            note_skip("already holding")
             return
 
     if _paper_has_open_position(paper_state, market_id=_mid, question=best.get("question", "")):
         log(f"  ⏸️  Already holding PAPER position on this market — skip (dedup)")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (already holding this market)")
-        skip_reasons.append("already holding paper position")
+        note_skip("already holding paper position")
         return
 
     if not dry_run and _live_market_lock_active(live_runtime_state, market_id=_mid, question=best.get("question", "")):
         log(f"  ⏸️  Live market lock active for this market — skip (dedup)")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (market lock active)")
-        skip_reasons.append("live market lock active")
+        note_skip("live market lock active")
         return
 
     # Fetch live CLOB price — required for fast markets (stale prices cause bad trades)
@@ -2211,7 +2247,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"  ⏸️  Spread {spread_pct:.1%} > max {MAX_SPREAD_PCT:.1%} — illiquid, skip")
             if not quiet and not ACTION_ONLY_LOGS:
                 print(f"📊 Summary: No trade (wide spread: {spread_pct:.1%})")
-            skip_reasons.append("wide spread")
+            note_skip("wide spread")
             _emit_skip_report()
             return
     else:
@@ -2224,7 +2260,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 _set_market_cooldown(__file__, best)
                 if not quiet and not ACTION_ONLY_LOGS:
                     print(f"📊 Summary: No trade (wide spread)")
-                skip_reasons.append("wide spread")
+                note_skip("wide spread")
                 _emit_skip_report()
                 return
         else:
@@ -2232,13 +2268,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             _set_market_cooldown(__file__, best)
             if not quiet and not ACTION_ONLY_LOGS:
                 print("📊 Summary: No trade (order book unavailable)")
-            skip_reasons.append("order book unavailable")
+            note_skip("order book unavailable")
             _emit_skip_report()
             return
 
     # Check minimum momentum
     if momentum_pct < MIN_MOMENTUM_PCT:
         log(f"  ⏸️  Momentum {momentum_pct:.3f}% < minimum {MIN_MOMENTUM_PCT}% — skip")
+        note_skip("momentum too weak")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (momentum too weak: {momentum_pct:.3f}%)")
         return
@@ -2254,10 +2291,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         divergence = market_yes_price - (0.50 - ENTRY_THRESHOLD)
         trade_rationale = f"{ASSET} down {momentum['momentum_pct']:+.3f}% but YES still ${market_yes_price:.3f}"
 
+    # Dead-zone filter: if divergence is too close to the noise floor, skip.
+    if abs(float(divergence)) < SIGNAL_DEAD_ZONE:
+        log(f"  ⏸️  Divergence {divergence:.3f} inside dead zone ±{SIGNAL_DEAD_ZONE:.2f} — skip")
+        note_skip("signal dead zone")
+        _emit_skip_report()
+        return
+
     # Build a multi-factor entry score instead of relying on one gate.
-    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < 0.15:
-        log(f"  ⏸️  Volume {momentum['volume_ratio']:.2f}x is too low for live quality — skip")
-        skip_reasons.append("extremely low volume")
+    if VOLUME_CONFIDENCE and momentum["volume_ratio"] < MIN_VOLUME_RATIO:
+        log(f"  ⏸️  Volume {momentum['volume_ratio']:.2f}x < {MIN_VOLUME_RATIO:.2f}x minimum — skip")
+        note_skip("extremely low volume")
         _emit_skip_report()
         return
 
@@ -2277,13 +2321,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     strategy_mode = None
     if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
         log(f"  ⏸️  Entry price ${price:.3f} outside global allowed range")
-        skip_reasons.append("price filter")
+        note_skip("price filter")
         _emit_skip_report()
         return
 
     if not dry_run and price < MIN_LIVE_ENTRY_PRICE:
         log(f"  ⏸️  Live entry price ${price:.3f} below minimum live floor ${MIN_LIVE_ENTRY_PRICE:.2f}")
-        skip_reasons.append("live min entry price")
+        note_skip("live min entry price")
         _emit_skip_report()
         return
 
@@ -2291,7 +2335,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         strategy_mode = "momentum"
     else:
         log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for momentum mode (< ${MOMENTUM_MAX_ENTRY:.2f})")
-        skip_reasons.append("price filter")
+        note_skip("price filter")
         _emit_skip_report()
         return
 
@@ -2309,7 +2353,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Require both a positive edge and a strong overall score.
     if score_details["edge"] <= 0:
         log(f"  ⏸️  Score rejected: edge too weak after fees (divergence {divergence:.3f}, min {min_divergence:.3f})")
-        skip_reasons.append("insufficient edge")
+        note_skip("insufficient edge")
         _emit_skip_report()
         return
     if score < ENTRY_SCORE_THRESHOLD:
@@ -2319,7 +2363,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}, time {score_details['time']:.2f}, "
             f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
         )
-        skip_reasons.append("entry score too low")
+        note_skip("entry score too low")
         _emit_skip_report()
         return
 
@@ -2350,7 +2394,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  ⏸️  Open exposure cap reached (${current_open_exposure:.2f}/${MAX_OPEN_EXPOSURE:.2f}) — skip")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (open exposure cap reached)")
-        skip_reasons.append("open exposure cap")
+        note_skip("open exposure cap")
         _emit_skip_report()
         return
     if position_size > remaining_exposure:
@@ -2360,7 +2404,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  ⏸️  Remaining exposure room ${position_size:.2f} < $0.50 — skip")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No trade (exposure room too small)")
-        skip_reasons.append("exposure room too small")
+        note_skip("exposure room too small")
         _emit_skip_report()
         return
 
@@ -2369,7 +2413,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         min_cost = MIN_SHARES_PER_ORDER * price
         if min_cost > position_size:
             log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
-            skip_reasons.append("position too small")
+            note_skip("position too small")
             _emit_skip_report(attempted=1)
             return
 
@@ -2583,7 +2627,7 @@ if __name__ == "__main__":
         now_ts = time.time()
         if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
             _last_heartbeat_ts = now_ts
-            print(f"💓 Heartbeat {_safe_et_timestamp()} | bot alive | monitoring for entry/exit")
+            print(f"💓 Heartbeat {_safe_et_timestamp()} | bot alive | {_format_skip_summary(_drain_skip_reason_counts())}")
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
