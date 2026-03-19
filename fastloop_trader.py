@@ -59,6 +59,175 @@ def _format_skip_summary(counts, limit=5):
     return f"no trade yet | last 10m skips: {shown}"
 
 
+def _format_skip_counts(counts, limit=6):
+    if not counts:
+        return "none"
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ", ".join(f"{reason}={count}" for reason, count in ordered[:limit])
+    extra = len(ordered) - limit
+    if extra > 0:
+        shown += f", +{extra} more"
+    return shown
+
+
+def _display_side_label(side):
+    s = str(side or "").lower()
+    if s == "yes":
+        return "UP"
+    if s == "no":
+        return "DOWN"
+    return str(side).upper()
+
+
+def _current_window_bounds_et(now_et=None):
+    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
+    start_minute = (now_et.minute // 5) * 5
+    start_et = now_et.replace(minute=start_minute, second=0, microsecond=0)
+    end_et = start_et + timedelta(minutes=5)
+    key = start_et.strftime("%Y-%m-%dT%H:%M")
+    return key, start_et, end_et
+
+
+def _format_window_label_et(start_et, end_et):
+    def _fmt(dt):
+        return dt.strftime("%I:%M%p").lstrip("0")
+    return f"{_fmt(start_et)}-{_fmt(end_et)} ET"
+
+
+def _render_time_left_bar(now_et, start_et, end_et, width=10):
+    total = max(1, int((end_et - start_et).total_seconds()))
+    remaining = max(0, int((end_et - now_et).total_seconds()))
+    filled = max(0, min(width, math.ceil((remaining / total) * width)))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {remaining // 60}:{remaining % 60:02d}"
+
+
+def _extract_live_roi_pct(snapshot):
+    if not snapshot:
+        return None
+    portfolio = snapshot.get("portfolio") if isinstance(snapshot, dict) else None
+    pnl_total = snapshot.get("pnl_total") if isinstance(snapshot, dict) else None
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def _path(obj, *path):
+        cur = obj
+        for key in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(key)
+        return cur
+
+    for path in [
+        ("roi_pct",), ("roi",), ("return_pct",), ("pnl_pct",),
+        ("stats", "roi_pct"), ("summary", "roi_pct"), ("portfolio", "roi_pct"),
+    ]:
+        val = _to_float(_path(portfolio, *path) if portfolio else None)
+        if val is not None:
+            return val
+
+    balance = _to_float(_path(portfolio, "balance_usdc") if portfolio else None)
+    pnl_total = _to_float(pnl_total)
+    if balance is not None and pnl_total is not None:
+        start_equity = balance - pnl_total
+        if abs(start_equity) > 1e-9:
+            return (pnl_total / start_equity) * 100.0
+    return None
+
+
+def _build_window_status_board(skill_file, dry_run=False):
+    global _window_reference_prices
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    window_key, start_et, end_et = _current_window_bounds_et(now_et)
+
+    momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
+    current_price = None
+    if momentum and momentum.get("price_now") is not None:
+        current_price = float(momentum.get("price_now"))
+
+    if window_key not in _window_reference_prices and current_price is not None:
+        _window_reference_prices[window_key] = current_price
+
+    # prune old windows
+    keep_prefixes = set()
+    try:
+        cur_dt = datetime.strptime(window_key, "%Y-%m-%dT%H:%M")
+        for delta in range(0, 4):
+            k = (cur_dt - timedelta(minutes=5 * delta)).strftime("%Y-%m-%dT%H:%M")
+            keep_prefixes.add(k)
+    except Exception:
+        pass
+    if keep_prefixes:
+        _window_reference_prices = {k: v for k, v in _window_reference_prices.items() if k in keep_prefixes}
+
+    reference_price = _window_reference_prices.get(window_key, current_price)
+    diff = None
+    diff_pct = None
+    if reference_price is not None and current_price is not None and reference_price != 0:
+        diff = current_price - reference_price
+        diff_pct = (diff / reference_price) * 100.0
+
+    side_label = "FLAT"
+    if diff is not None:
+        if diff > 0:
+            side_label = "UP"
+        elif diff < 0:
+            side_label = "DOWN"
+
+    session_state = _load_paper_state(skill_file) if dry_run else _load_daily_spend(skill_file)
+    session_trades = int(session_state.get("trades", 0) or 0)
+
+    if dry_run:
+        paper_state = _load_paper_state(skill_file)
+        pnl_total = float(paper_state.get("realized_pnl", 0.0) or 0.0)
+        roi_pct = None
+    else:
+        live_snapshot = _get_live_pnl_snapshot(skill_file)
+        pnl_total = live_snapshot.get("pnl_total") if live_snapshot else None
+        roi_pct = _extract_live_roi_pct(live_snapshot)
+
+    macd_line = momentum.get("macd_line") if momentum else None
+    macd_signal = momentum.get("macd_signal") if momentum else None
+    macd_hist = momentum.get("macd_hist") if momentum else None
+    macd_bias = momentum.get("macd_bias") if momentum else "N/A"
+
+    skip_counts = _drain_skip_reason_counts()
+    skip_text = _format_skip_counts(skip_counts)
+
+    lines = []
+    lines.append(f"📋 {ASSET} {WINDOW} | Market {_format_window_label_et(start_et, end_et)}")
+    lines.append(f"  Time left:       {_render_time_left_bar(now_et, start_et, end_et)}")
+    if reference_price is not None:
+        lines.append(f"  Price to beat:   ${reference_price:,.2f}")
+    else:
+        lines.append("  Price to beat:   n/a")
+    if current_price is not None:
+        lines.append(f"  Current {ASSET}:    ${current_price:,.2f}")
+    else:
+        lines.append(f"  Current {ASSET}:    n/a")
+    if diff is not None and diff_pct is not None:
+        lines.append(f"  Diff:            {diff:+.2f} ({diff_pct:+.2f}%)")
+    else:
+        lines.append("  Diff:            n/a")
+    lines.append(f"  Side:            {side_label}")
+    lines.append(f"  Session trades:  {session_trades}")
+    if pnl_total is not None:
+        roi_txt = f" | ROI {roi_pct:+.2f}%" if roi_pct is not None else ""
+        lines.append(f"  Total P&L:       ${float(pnl_total):+.2f} USDC{roi_txt}")
+    else:
+        lines.append("  Total P&L:       unavailable")
+    if macd_line is not None and macd_signal is not None and macd_hist is not None:
+        lines.append(
+            f"  MACD(12,26,9):   line {float(macd_line):+.4f} | signal {float(macd_signal):+.4f} | hist {float(macd_hist):+.4f} | {macd_bias}"
+        )
+    else:
+        lines.append("  MACD(12,26,9):   unavailable")
+    lines.append(f"  Window skips:    {skip_text}")
+    return "\n".join(lines)
+
 
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
@@ -141,11 +310,12 @@ BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
 LIVE_SCAN_INTERVAL_SECONDS = 15  # faster loop while running in live mode
 FOCUSED_LIVE_SCAN_INTERVAL_SECONDS = 5  # tighter management cadence while a live position/lock is active
-HEARTBEAT_SECONDS = 600  # emit a lightweight alive message every 10 minutes
+WINDOW_BOARD_INTERVAL_SECONDS = 300  # emit one status board per 5-minute market window
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
-_last_heartbeat_ts = 0
+_last_window_board_key = None
 _last_auto_redeem_ts = 0
 _skip_reason_counts = {}
+_window_reference_prices = {}
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -758,7 +928,7 @@ def _set_live_monitor(market_id, side, log):
     try:
         client = get_client()
         client.set_monitor(market_id, side=side, stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT)
-        log(f"  🛡️  Live monitor armed for {side.upper()} ({STOP_LOSS_PCT:.0%} stop / {TAKE_PROFIT_PCT:.0%} take profit)")
+        log(f"  🛡️  Live monitor armed for {_display_side_label(side)} ({STOP_LOSS_PCT:.0%} stop / {TAKE_PROFIT_PCT:.0%} take profit)")
         return True
     except Exception as e:
         log(f"  ⚠️  Could not set live monitor: {e}")
@@ -840,7 +1010,7 @@ def manage_live_positions(skill_file, log):
         if exit_notional < 1.0:
             log(
                 f"  ⏸️  Live exit deferred on {question[:45]}... "
-                f"({reason}, held {shares:.4f} {side.upper()} @ ${current_price:.3f}, value ${exit_notional:.2f} < $1 minimum)",
+                f"({reason}, held {shares:.4f} {_display_side_label(side)} @ ${current_price:.3f}, value ${exit_notional:.2f} < $1 minimum)",
                 force=True,
             )
             continue
@@ -851,7 +1021,7 @@ def manage_live_positions(skill_file, log):
             avg_exit = (proceeds / shares) if shares > 0 and proceeds > 0 else current_price
             realized = shares * ((avg_exit or current_price) - entry_price)
             log(
-                f"  ✅ Sold {shares:.2f} {side.upper()} shares @ ${(avg_exit or current_price):.3f} "
+                f"  ✅ Sold {shares:.2f} {_display_side_label(side)} shares @ ${(avg_exit or current_price):.3f} "
                 f"({reason}, est P&L ${realized:.2f})",
                 force=True,
             )
@@ -903,7 +1073,7 @@ def manage_live_positions(skill_file, log):
                     avg_exit = (proceeds / retry_shares) if retry_shares > 0 and proceeds > 0 else current_price
                     realized = retry_shares * ((avg_exit or current_price) - entry_price)
                     log(
-                        f"  ✅ Sold {retry_shares:.2f} {side.upper()} shares @ ${(avg_exit or current_price):.3f} "
+                        f"  ✅ Sold {retry_shares:.2f} {_display_side_label(side)} shares @ ${(avg_exit or current_price):.3f} "
                         f"({reason}, retry after share refresh, est P&L ${realized:.2f})",
                         force=True,
                     )
@@ -939,7 +1109,7 @@ def manage_live_positions(skill_file, log):
 
         log(
             f"  ❌ Live sell failed on {question[:45]}... "
-            f"({reason}, held {shares:.4f} {side.upper()}, entry ${entry_price:.3f}, now ${current_price:.3f} via {price_source}, "
+            f"({reason}, held {shares:.4f} {_display_side_label(side)}, entry ${entry_price:.3f}, now ${current_price:.3f} via {price_source}, "
             f"TP ${target_price:.3f}, SL ${stop_price:.3f}): {err}",
             force=True,
         )
@@ -1684,12 +1854,12 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
         # Coinbase returns newest-first candles and the first candle may still be in progress.
         # Sort defensively and skip the newest incomplete candle so momentum only uses completed data.
         ordered = sorted(result, key=lambda c: c[0], reverse=True)
-        completed = ordered[1:1 + max(lookback_minutes, 3)]
+        completed = ordered[1:1 + max(lookback_minutes, 40)]
 
-        if len(completed) < 2:
+        if len(completed) < max(lookback_minutes, 3):
             return None
 
-        candles = completed
+        candles = completed[:max(lookback_minutes, 3)]
 
         # Coinbase candle format:
         # [time, low, high, open, close, volume]
@@ -1716,6 +1886,39 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
         latest_volume = volumes[0]
         volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
 
+        def _ema_series(values, period):
+            alpha = 2.0 / (period + 1.0)
+            out = []
+            ema = None
+            for value in values:
+                value = float(value)
+                if ema is None:
+                    ema = value
+                else:
+                    ema = (value * alpha) + (ema * (1.0 - alpha))
+                out.append(ema)
+            return out
+
+        macd_line = None
+        macd_signal = None
+        macd_hist = None
+        macd_bias = "N/A"
+        closes_full = [float(c[4]) for c in reversed(completed)]  # oldest -> newest
+        if len(closes_full) >= 35:
+            ema12 = _ema_series(closes_full, 12)
+            ema26 = _ema_series(closes_full, 26)
+            macd_series = [a - b for a, b in zip(ema12, ema26)]
+            signal_series = _ema_series(macd_series, 9)
+            macd_line = float(macd_series[-1])
+            macd_signal = float(signal_series[-1])
+            macd_hist = float(macd_line - macd_signal)
+            if macd_hist > 0 and macd_line >= macd_signal:
+                macd_bias = "UP"
+            elif macd_hist < 0 and macd_line <= macd_signal:
+                macd_bias = "DOWN"
+            else:
+                macd_bias = "MIXED"
+
         return {
             "momentum_pct": momentum_pct,
             "recent_momentum_pct": recent_pct,
@@ -1727,6 +1930,10 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
             "latest_volume": latest_volume,
             "volume_ratio": volume_ratio,
             "candles": len(candles),
+            "macd_line": macd_line,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "macd_bias": macd_bias,
         }
 
     except Exception:
@@ -2417,7 +2624,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             _emit_skip_report(attempted=1)
             return
 
-    log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
+    log(f"  ✅ Signal: {_display_side_label(side)} — {trade_rationale}{vol_note}", force=True)
     log(f"  Divergence: {divergence:.3f} | est entry ${price:.3f} | fee floor {min_divergence:.3f}", force=True)
 
     # Step 5: Get market ID (already have it from Simmer API, or import from Gamma)
@@ -2434,7 +2641,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     execution_error = None
     tag = "SIMULATED" if dry_run else "LIVE"
-    log(f"  Executing {side.upper()} trade for ${position_size:.2f} ({tag})...", force=True)
+    log(f"  Executing {_display_side_label(side)} trade for ${position_size:.2f} ({tag})...", force=True)
     result = execute_trade(market_id, side, amount=position_size, action="buy")
 
     if result and result.get("success"):
@@ -2443,7 +2650,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         display_fill_price = price if result.get("simulated") else _infer_live_fill_price(position_size, shares, price)
         if result.get("simulated"):
             log(
-                f"  ✅ [PAPER] Bought {shares:.1f} {side.upper()} shares @ ${display_fill_price:.3f}",
+                f"  ✅ [PAPER] Bought {shares:.1f} {_display_side_label(side)} shares @ ${display_fill_price:.3f}",
                 force=True,
             )
 
@@ -2482,7 +2689,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             display_fill_price = float(confirmed_fill or display_fill_price)
             actual_cost = float(confirmed_cost or position_size)
             log(
-                f"  ✅ Bought {shares:.2f} {side.upper()} shares @ ${display_fill_price:.3f}"
+                f"  ✅ Bought {shares:.2f} {_display_side_label(side)} shares @ ${display_fill_price:.3f}"
                 + (f" (confirmed fill; quote was ${price:.3f})" if abs(display_fill_price - price) > 1e-6 else ""),
                 force=True,
             )
@@ -2624,10 +2831,11 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Loop error: {e}")
 
-        now_ts = time.time()
-        if now_ts - _last_heartbeat_ts >= HEARTBEAT_SECONDS:
-            _last_heartbeat_ts = now_ts
-            print(f"💓 Heartbeat {_safe_et_timestamp()} | bot alive | {_format_skip_summary(_drain_skip_reason_counts())}")
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        window_key, _window_start_et, _window_end_et = _current_window_bounds_et(now_et)
+        if window_key != _last_window_board_key:
+            _last_window_board_key = window_key
+            print(_build_window_status_board(__file__, dry_run=dry_run))
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
