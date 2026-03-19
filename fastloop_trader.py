@@ -22,6 +22,7 @@ import math
 import argparse
 import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
@@ -1616,7 +1617,6 @@ def _parse_fast_market_end_time(question):
     if not match:
         return None
     try:
-        from zoneinfo import ZoneInfo
         date_str = match.group(1)
         time_str = match.group(2)
         year = datetime.now(timezone.utc).year
