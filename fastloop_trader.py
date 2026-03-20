@@ -102,15 +102,17 @@ def _render_time_left_bar(now_et, start_et, end_et, width=10):
 
 
 def _extract_live_roi_pct(snapshot):
-    """Best-effort ROI pulled from the live Simmer portfolio.
+    """Best-effort ROI pulled directly from the live Simmer portfolio.
 
-    Prefer explicit ROI/return fields from Simmer. Only fall back to a computed
-    value when the portfolio exposes a total-equity style field.
+    Only trust explicit ROI/return fields exposed by Simmer. If those fields are
+    unavailable, return None rather than computing a potentially misleading value
+    from an inferred baseline.
     """
     if not snapshot:
         return None
     portfolio = snapshot.get("portfolio") if isinstance(snapshot, dict) else None
-    pnl_total = snapshot.get("pnl_total") if isinstance(snapshot, dict) else None
+    if not isinstance(portfolio, dict):
+        return None
 
     def _to_float(v):
         try:
@@ -126,79 +128,55 @@ def _extract_live_roi_pct(snapshot):
             cur = cur.get(key)
         return cur
 
-    # First choice: trust explicit ROI/return fields from Simmer if present.
-    for path in [
+    explicit_paths = [
         ("roi_pct",), ("roi",), ("return_pct",), ("pnl_pct",), ("total_return_pct",),
-        ("stats", "roi_pct"), ("stats", "roi"), ("summary", "roi_pct"), ("summary", "roi"),
-        ("portfolio", "roi_pct"), ("portfolio", "roi"), ("metrics", "roi_pct"), ("metrics", "roi"),
-    ]:
-        val = _to_float(_path(portfolio, *path) if portfolio else None)
+        ("roiPercent",), ("returnPercent",), ("pnlPercent",), ("totalReturnPercent",),
+        ("stats", "roi_pct"), ("stats", "roi"), ("stats", "return_pct"), ("stats", "pnl_pct"),
+        ("summary", "roi_pct"), ("summary", "roi"), ("summary", "return_pct"), ("summary", "pnl_pct"),
+        ("portfolio", "roi_pct"), ("portfolio", "roi"), ("portfolio", "return_pct"), ("portfolio", "pnl_pct"),
+        ("metrics", "roi_pct"), ("metrics", "roi"), ("metrics", "return_pct"), ("metrics", "pnl_pct"),
+        ("performance", "roi_pct"), ("performance", "roi"), ("performance", "return_pct"), ("performance", "pnl_pct"),
+    ]
+    for path in explicit_paths:
+        val = _to_float(_path(portfolio, *path))
         if val is not None:
             return val
-
-    pnl_total = _to_float(pnl_total)
-    if pnl_total is None or not isinstance(portfolio, dict):
-        return None
-
-    # Second choice: derive ROI from a total-equity style field if available.
-    equity = None
-    for path in [
-        ("equity",), ("total_equity",), ("total_value",), ("account_value",), ("portfolio_value",),
-        ("summary", "equity"), ("summary", "total_value"), ("stats", "equity"),
-        ("portfolio", "equity"), ("portfolio", "total_value"),
-    ]:
-        equity = _to_float(_path(portfolio, *path))
-        if equity is not None:
-            break
-
-    # Third choice: approximate equity from cash + exposure if provided by Simmer.
-    if equity is None:
-        balance = _to_float(_path(portfolio, "balance_usdc"))
-        exposure = None
-        for path in [
-            ("total_exposure",), ("exposure",), ("positions_value",), ("notional_open",),
-            ("summary", "total_exposure"), ("portfolio", "total_exposure"),
-        ]:
-            exposure = _to_float(_path(portfolio, *path))
-            if exposure is not None:
-                break
-        if balance is not None:
-            equity = balance + (exposure or 0.0)
-
-    if equity is None:
-        return None
-
-    start_equity = equity - pnl_total
-    if abs(start_equity) <= 1e-9:
-        return None
-    return (pnl_total / start_equity) * 100.0
+    return None
 
 
 def _guess_market_slug_for_window(asset="BTC", window="5m", question=None):
-    """Find the current live market slug for this asset/window."""
+    """Best-effort live market slug lookup for this asset/window."""
     qnorm = (question or "").strip().lower()
-    # Prefer Gamma because it reliably returns slugs.
     try:
         gamma_markets = _discover_via_gamma(asset, window)
         best_gamma = find_best_fast_market(gamma_markets)
-        if best_gamma and best_gamma.get("slug"):
-            return best_gamma.get("slug")
         if qnorm:
             for m in gamma_markets:
                 if (m.get("question") or "").strip().lower() == qnorm and m.get("slug"):
                     return m.get("slug")
+        if best_gamma and best_gamma.get("slug"):
+            return best_gamma.get("slug")
     except Exception:
         pass
     return None
 
 
 def _fetch_polymarket_price_to_beat(slug):
-    """Fetch the official 'Price to Beat' text from the Polymarket event page."""
+    """Fetch the official 'Price to Beat' text from a Polymarket event page.
+
+    We fetch once per new 5-minute window and cache the result. The event page
+    itself shows the opening reference price for that window. If parsing fails,
+    return None rather than inventing a fallback.
+    """
     if not slug:
         return None
     url = f"https://polymarket.com/event/{slug}"
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        })
         with urlopen(req, timeout=12) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
     except Exception:
@@ -206,9 +184,11 @@ def _fetch_polymarket_price_to_beat(slug):
 
     import re
     patterns = [
-        r'Price to Beat[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
-        r'"Price to Beat"[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
-        r'price to beat[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
+        r'Price\s*to\s*beat\.?\s*\$\s*([0-9,]+(?:\.[0-9]+)?)',
+        r'Price\s*to\s*Beat[^$]{0,120}\$\s*([0-9,]+(?:\.[0-9]+)?)',
+        r'Price\s*to\s*Beat"\s*of\s*\$\s*([0-9,]+(?:\.[0-9]+)?)',
+        r'opening\s+reference\s+price[^$]{0,120}\$\s*([0-9,]+(?:\.[0-9]+)?)',
+        r'content="[^"]*Price\s*to\s*Beat[^$]{0,120}\$\s*([0-9,]+(?:\.[0-9]+)?)',
     ]
     for pat in patterns:
         m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
@@ -220,21 +200,23 @@ def _fetch_polymarket_price_to_beat(slug):
     return None
 
 
-def _get_window_price_to_beat(asset, window, window_key, question=None):
+def _get_window_price_to_beat(asset, window, window_key, slug=None, question=None):
     """Get the official Polymarket Price to Beat once per window, cached."""
     global _window_price_to_beat_meta
 
     cached = _window_price_to_beat_meta.get(window_key)
-    if cached and cached.get("price") is not None:
-        return float(cached["price"])
+    if cached:
+        if slug and not cached.get("slug"):
+            cached["slug"] = slug
+        if cached.get("price") is not None:
+            return float(cached["price"])
 
-    slug = _guess_market_slug_for_window(asset=asset, window=window, question=question)
+    if not slug:
+        slug = _guess_market_slug_for_window(asset=asset, window=window, question=question)
     price = _fetch_polymarket_price_to_beat(slug) if slug else None
 
-    # Cache the result (including failures) so we only try once per window.
     _window_price_to_beat_meta[window_key] = {"slug": slug, "price": price}
 
-    # prune old windows
     keep_keys = set()
     try:
         cur_dt = datetime.strptime(window_key, "%Y-%m-%dT%H:%M")
@@ -249,23 +231,30 @@ def _get_window_price_to_beat(asset, window, window_key, question=None):
 
 
 def _build_window_status_board(skill_file, dry_run=False):
-    global _window_reference_prices
     now_et = datetime.now(ZoneInfo("America/New_York"))
     window_key, start_et, end_et = _current_window_bounds_et(now_et)
 
     momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
-    # Official Polymarket reference for the active 5m window when available.
     best_question = None
+    best_slug = None
     try:
         markets = discover_fast_market_markets(ASSET, WINDOW)
         best_market = find_best_fast_market(markets)
         if best_market:
             best_question = best_market.get("question")
+            best_slug = best_market.get("slug")
     except Exception:
         best_question = None
+        best_slug = None
 
-    reference_price = _get_window_price_to_beat(ASSET, WINDOW, window_key, question=best_question)
+    reference_price = _get_window_price_to_beat(
+        ASSET,
+        WINDOW,
+        window_key,
+        slug=best_slug,
+        question=best_question,
+    )
 
     session_state = _load_paper_state(skill_file) if dry_run else _load_daily_spend(skill_file)
     session_trades = int(session_state.get("trades", 0) or 0)
@@ -287,24 +276,24 @@ def _build_window_status_board(skill_file, dry_run=False):
     skip_counts = _drain_skip_reason_counts()
     skip_text = _format_skip_counts(skip_counts)
 
-    lines = []
-    lines.append(f"📋 {ASSET} {WINDOW} | Market {_format_window_label_et(start_et, end_et)}")
-    if reference_price is not None:
-        lines.append(f"  Price to beat:   ${reference_price:,.2f}")
-    else:
-        lines.append("  Price to beat:   unavailable")
-    lines.append(f"  Session trades:  {session_trades}")
+    lines = [
+        f"📋 {ASSET} {WINDOW} | Market {_format_window_label_et(start_et, end_et)}",
+        f"  Price to beat:   ${reference_price:,.2f}" if reference_price is not None else "  Price to beat:   unavailable",
+        f"  Session trades:  {session_trades}",
+    ]
     if pnl_total is not None:
         roi_txt = f" | ROI {roi_pct:+.2f}%" if roi_pct is not None else ""
         lines.append(f"  Total P&L:       ${float(pnl_total):+.2f} USDC{roi_txt}")
     else:
         lines.append("  Total P&L:       unavailable")
+
     if macd_line is not None and macd_signal is not None and macd_hist is not None:
         lines.append(
             f"  MACD(12,26,9):   line {float(macd_line):+.4f} | signal {float(macd_signal):+.4f} | hist {float(macd_hist):+.4f} | {macd_bias}"
         )
     else:
         lines.append("  MACD(12,26,9):   unavailable")
+
     lines.append(f"  Window skips:    {skip_text}")
     return "\n".join(lines)
 
@@ -2360,7 +2349,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         live_pnl_24h = None if not live_pnl else live_pnl.get("pnl_24h_effective")
 
         if live_pnl_24h is None:
-            log("  ⚠️  Could not read live 24h P&L from portfolio API.", force=True)
+            if not ACTION_ONLY_LOGS:
+                log("  ⚠️  Could not read live 24h P&L from portfolio API.", force=True)
         elif live_pnl_24h <= -abs(DAILY_LOSS_LIMIT):
             _activate_loss_pause(__file__, live_pnl_24h, reason="live_daily_loss_stop")
             log(
@@ -2917,7 +2907,8 @@ if __name__ == "__main__":
         window_key, _window_start_et, _window_end_et = _current_window_bounds_et(now_et)
         if window_key != _last_window_board_key:
             _last_window_board_key = window_key
-            print(_build_window_status_board(__file__, dry_run=dry_run))
+            board = _build_window_status_board(__file__, dry_run=dry_run)
+            print("\n" + board, flush=True)
 
         if args.live and _has_active_live_market_lock(__file__):
             sleep_seconds = FOCUSED_LIVE_SCAN_INTERVAL_SECONDS
