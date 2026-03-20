@@ -286,7 +286,7 @@ except ImportError:
 CONFIG_SCHEMA = {
     "entry_threshold": {"default": 0.05, "env": "SIMMER_SPRINT_ENTRY", "type": float,
                         "help": "Min price divergence from 50¢ to trigger trade"},
-    "min_momentum_pct": {"default": 0.05, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
+    "min_momentum_pct": {"default": 0.03, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
     "entry_score_threshold": {"default": 0.62, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
                          "help": "Minimum multi-factor entry score required to trade (0-1)"},
@@ -2882,4 +2882,3 @@ if __name__ == "__main__":
         if not ACTION_ONLY_LOGS:
             print(f"\n⏳ Waiting {sleep_seconds} seconds before next scan...\n")
         time.sleep(sleep_seconds)
-
