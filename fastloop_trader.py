@@ -102,6 +102,11 @@ def _render_time_left_bar(now_et, start_et, end_et, width=10):
 
 
 def _extract_live_roi_pct(snapshot):
+    """Best-effort ROI pulled from the live Simmer portfolio.
+
+    Prefer explicit ROI/return fields from Simmer. Only fall back to a computed
+    value when the portfolio exposes a total-equity style field.
+    """
     if not snapshot:
         return None
     portfolio = snapshot.get("portfolio") if isinstance(snapshot, dict) else None
@@ -121,21 +126,126 @@ def _extract_live_roi_pct(snapshot):
             cur = cur.get(key)
         return cur
 
+    # First choice: trust explicit ROI/return fields from Simmer if present.
     for path in [
-        ("roi_pct",), ("roi",), ("return_pct",), ("pnl_pct",),
-        ("stats", "roi_pct"), ("summary", "roi_pct"), ("portfolio", "roi_pct"),
+        ("roi_pct",), ("roi",), ("return_pct",), ("pnl_pct",), ("total_return_pct",),
+        ("stats", "roi_pct"), ("stats", "roi"), ("summary", "roi_pct"), ("summary", "roi"),
+        ("portfolio", "roi_pct"), ("portfolio", "roi"), ("metrics", "roi_pct"), ("metrics", "roi"),
     ]:
         val = _to_float(_path(portfolio, *path) if portfolio else None)
         if val is not None:
             return val
 
-    balance = _to_float(_path(portfolio, "balance_usdc") if portfolio else None)
     pnl_total = _to_float(pnl_total)
-    if balance is not None and pnl_total is not None:
-        start_equity = balance - pnl_total
-        if abs(start_equity) > 1e-9:
-            return (pnl_total / start_equity) * 100.0
+    if pnl_total is None or not isinstance(portfolio, dict):
+        return None
+
+    # Second choice: derive ROI from a total-equity style field if available.
+    equity = None
+    for path in [
+        ("equity",), ("total_equity",), ("total_value",), ("account_value",), ("portfolio_value",),
+        ("summary", "equity"), ("summary", "total_value"), ("stats", "equity"),
+        ("portfolio", "equity"), ("portfolio", "total_value"),
+    ]:
+        equity = _to_float(_path(portfolio, *path))
+        if equity is not None:
+            break
+
+    # Third choice: approximate equity from cash + exposure if provided by Simmer.
+    if equity is None:
+        balance = _to_float(_path(portfolio, "balance_usdc"))
+        exposure = None
+        for path in [
+            ("total_exposure",), ("exposure",), ("positions_value",), ("notional_open",),
+            ("summary", "total_exposure"), ("portfolio", "total_exposure"),
+        ]:
+            exposure = _to_float(_path(portfolio, *path))
+            if exposure is not None:
+                break
+        if balance is not None:
+            equity = balance + (exposure or 0.0)
+
+    if equity is None:
+        return None
+
+    start_equity = equity - pnl_total
+    if abs(start_equity) <= 1e-9:
+        return None
+    return (pnl_total / start_equity) * 100.0
+
+
+def _guess_market_slug_for_window(asset="BTC", window="5m", question=None):
+    """Find the current live market slug for this asset/window."""
+    qnorm = (question or "").strip().lower()
+    # Prefer Gamma because it reliably returns slugs.
+    try:
+        gamma_markets = _discover_via_gamma(asset, window)
+        best_gamma = find_best_fast_market(gamma_markets)
+        if best_gamma and best_gamma.get("slug"):
+            return best_gamma.get("slug")
+        if qnorm:
+            for m in gamma_markets:
+                if (m.get("question") or "").strip().lower() == qnorm and m.get("slug"):
+                    return m.get("slug")
+    except Exception:
+        pass
     return None
+
+
+def _fetch_polymarket_price_to_beat(slug):
+    """Fetch the official 'Price to Beat' text from the Polymarket event page."""
+    if not slug:
+        return None
+    url = f"https://polymarket.com/event/{slug}"
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=12) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    import re
+    patterns = [
+        r'Price to Beat[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
+        r'"Price to Beat"[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
+        r'price to beat[^$]{0,80}\$([0-9,]+(?:\.[0-9]+)?)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                pass
+    return None
+
+
+def _get_window_price_to_beat(asset, window, window_key, question=None):
+    """Get the official Polymarket Price to Beat once per window, cached."""
+    global _window_price_to_beat_meta
+
+    cached = _window_price_to_beat_meta.get(window_key)
+    if cached and cached.get("price") is not None:
+        return float(cached["price"])
+
+    slug = _guess_market_slug_for_window(asset=asset, window=window, question=question)
+    price = _fetch_polymarket_price_to_beat(slug) if slug else None
+
+    # Cache the result (including failures) so we only try once per window.
+    _window_price_to_beat_meta[window_key] = {"slug": slug, "price": price}
+
+    # prune old windows
+    keep_keys = set()
+    try:
+        cur_dt = datetime.strptime(window_key, "%Y-%m-%dT%H:%M")
+        for delta in range(0, 6):
+            keep_keys.add((cur_dt - timedelta(minutes=5 * delta)).strftime("%Y-%m-%dT%H:%M"))
+    except Exception:
+        pass
+    if keep_keys:
+        _window_price_to_beat_meta = {k: v for k, v in _window_price_to_beat_meta.items() if k in keep_keys}
+
+    return float(price) if price is not None else None
 
 
 def _build_window_status_board(skill_file, dry_run=False):
@@ -144,38 +254,18 @@ def _build_window_status_board(skill_file, dry_run=False):
     window_key, start_et, end_et = _current_window_bounds_et(now_et)
 
     momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
-    current_price = None
-    if momentum and momentum.get("price_now") is not None:
-        current_price = float(momentum.get("price_now"))
 
-    if window_key not in _window_reference_prices and current_price is not None:
-        _window_reference_prices[window_key] = current_price
-
-    # prune old windows
-    keep_prefixes = set()
+    # Official Polymarket reference for the active 5m window when available.
+    best_question = None
     try:
-        cur_dt = datetime.strptime(window_key, "%Y-%m-%dT%H:%M")
-        for delta in range(0, 4):
-            k = (cur_dt - timedelta(minutes=5 * delta)).strftime("%Y-%m-%dT%H:%M")
-            keep_prefixes.add(k)
+        markets = discover_fast_market_markets(ASSET, WINDOW)
+        best_market = find_best_fast_market(markets)
+        if best_market:
+            best_question = best_market.get("question")
     except Exception:
-        pass
-    if keep_prefixes:
-        _window_reference_prices = {k: v for k, v in _window_reference_prices.items() if k in keep_prefixes}
+        best_question = None
 
-    reference_price = _window_reference_prices.get(window_key, current_price)
-    diff = None
-    diff_pct = None
-    if reference_price is not None and current_price is not None and reference_price != 0:
-        diff = current_price - reference_price
-        diff_pct = (diff / reference_price) * 100.0
-
-    side_label = "FLAT"
-    if diff is not None:
-        if diff > 0:
-            side_label = "UP"
-        elif diff < 0:
-            side_label = "DOWN"
+    reference_price = _get_window_price_to_beat(ASSET, WINDOW, window_key, question=best_question)
 
     session_state = _load_paper_state(skill_file) if dry_run else _load_daily_spend(skill_file)
     session_trades = int(session_state.get("trades", 0) or 0)
@@ -199,20 +289,10 @@ def _build_window_status_board(skill_file, dry_run=False):
 
     lines = []
     lines.append(f"📋 {ASSET} {WINDOW} | Market {_format_window_label_et(start_et, end_et)}")
-    lines.append(f"  Time left:       {_render_time_left_bar(now_et, start_et, end_et)}")
     if reference_price is not None:
         lines.append(f"  Price to beat:   ${reference_price:,.2f}")
     else:
-        lines.append("  Price to beat:   n/a")
-    if current_price is not None:
-        lines.append(f"  Current {ASSET}:    ${current_price:,.2f}")
-    else:
-        lines.append(f"  Current {ASSET}:    n/a")
-    if diff is not None and diff_pct is not None:
-        lines.append(f"  Diff:            {diff:+.2f} ({diff_pct:+.2f}%)")
-    else:
-        lines.append("  Diff:            n/a")
-    lines.append(f"  Side:            {side_label}")
+        lines.append("  Price to beat:   unavailable")
     lines.append(f"  Session trades:  {session_trades}")
     if pnl_total is not None:
         roi_txt = f" | ROI {roi_pct:+.2f}%" if roi_pct is not None else ""
@@ -316,6 +396,7 @@ _last_window_board_key = None
 _last_auto_redeem_ts = 0
 _skip_reason_counts = {}
 _window_reference_prices = {}
+_window_price_to_beat_meta = {}
 SINGLE_POSITION_LIVE_MODE = True
 ENABLE_CONTRARIAN = False
 LIVE_TIME_STOP_SECONDS = 60
@@ -1704,6 +1785,7 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
                 markets.append({
                     "question": m.question,
                     "market_id": m.id,  # Already imported — no import step needed
+                    "slug": getattr(m, "slug", None),
                     "end_time": end_time,
                     "clob_token_ids": clob_tokens,
                     "is_live_now": m.is_live_now,
