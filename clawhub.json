@@ -1,5 +1,5 @@
 {
-  "emoji": "\u26a1",
+  "emoji": "⚡",
   "requires": {
     "env": [
       "SIMMER_API_KEY"
@@ -16,81 +16,108 @@
   },
   "tunables": [
     {
-      "env": "SIMMER_FASTLOOP_ENTRY_THRESHOLD",
+      "env": "SIMMER_SPRINT_ENTRY",
       "type": "number",
       "default": 0.05,
-      "range": [
-        0.01,
-        0.3
-      ],
+      "range": [0.01, 0.15],
       "step": 0.01,
       "label": "Entry edge threshold"
     },
     {
-      "env": "SIMMER_FASTLOOP_MOMENTUM_THRESHOLD",
+      "env": "SIMMER_SPRINT_MOMENTUM",
       "type": "number",
       "default": 0.03,
-      "range": [
-        0.01,
-        0.2
-      ],
+      "range": [0.01, 0.10],
       "step": 0.01,
-      "label": "Momentum threshold"
+      "label": "Momentum threshold (%)"
     },
     {
-      "env": "SIMMER_FASTLOOP_MAX_POSITION_USD",
+      "env": "SIMMER_SPRINT_SCORE_THRESHOLD",
       "type": "number",
-      "default": 10,
-      "range": [
-        1,
-        50
-      ],
-      "step": 5,
-      "label": "Max position size"
+      "default": 0.62,
+      "range": [0.30, 0.90],
+      "step": 0.01,
+      "label": "Entry score threshold"
     },
     {
-      "env": "SIMMER_FASTLOOP_LOOKBACK_MINUTES",
+      "env": "SIMMER_SPRINT_MAX_POSITION",
       "type": "number",
-      "default": 30,
-      "range": [
-        5,
-        120
-      ],
-      "step": 5,
+      "default": 2.5,
+      "range": [1.0, 25.0],
+      "step": 0.5,
+      "label": "Max position size (USDC)"
+    },
+    {
+      "env": "AUTOMATON_MAX_BET",
+      "type": "number",
+      "default": 2.5,
+      "range": [1.0, 25.0],
+      "step": 0.5,
+      "label": "Automaton max bet clamp"
+    },
+    {
+      "env": "SIMMER_SPRINT_LOOKBACK",
+      "type": "number",
+      "default": 5,
+      "range": [1, 60],
+      "step": 1,
       "label": "Lookback window (minutes)"
     },
     {
-      "env": "SIMMER_FASTLOOP_MIN_TIME_BETWEEN_TRADES_SEC",
+      "env": "SIMMER_SPRINT_MIN_TIME",
+      "type": "number",
+      "default": 120,
+      "range": [30, 240],
+      "step": 15,
+      "label": "Minimum time remaining (seconds)"
+    },
+    {
+      "env": "SIMMER_SPRINT_MAX_EXPOSURE",
+      "type": "number",
+      "default": 2.5,
+      "range": [1.0, 25.0],
+      "step": 0.5,
+      "label": "Max open exposure (USDC)"
+    },
+    {
+      "env": "SIMMER_SPRINT_TP",
+      "type": "number",
+      "default": 0.15,
+      "range": [0.05, 0.30],
+      "step": 0.01,
+      "label": "Take profit (%)"
+    },
+    {
+      "env": "SIMMER_SPRINT_SL",
+      "type": "number",
+      "default": 0.08,
+      "range": [0.02, 0.20],
+      "step": 0.01,
+      "label": "Stop loss (%)"
+    },
+    {
+      "env": "SIMMER_SPRINT_DAILY_LOSS",
+      "type": "number",
+      "default": 20.0,
+      "range": [5.0, 100.0],
+      "step": 5.0,
+      "label": "Daily loss stop (USDC)"
+    },
+    {
+      "env": "SIMMER_SPRINT_PAUSE_HOURS",
+      "type": "number",
+      "default": 24,
+      "range": [1, 48],
+      "step": 1,
+      "label": "Pause after loss stop (hours)"
+    },
+    {
+      "env": "SIMMER_SPRINT_RESOLVE_EXIT",
       "type": "number",
       "default": 60,
-      "range": [
-        10,
-        600
-      ],
-      "step": 10,
-      "label": "Min time between trades (seconds)"
-    },
-    {
-      "env": "SIMMER_FASTLOOP_DAILY_BUDGET_USD",
-      "type": "number",
-      "default": 50,
-      "range": [
-        10,
-        100
-      ],
-      "step": 10,
-      "label": "Daily budget"
-    },
-    {
-      "env": "SIMMER_FASTLOOP_VOL_CONFIDENCE_MIN",
-      "type": "number",
-      "default": 0.5,
-      "range": [
-        0.1,
-        1.0
-      ],
-      "step": 0.05,
-      "label": "Minimum volatility confidence"
+      "range": [5, 120],
+      "step": 5,
+      "label": "Near-expiry exit threshold (seconds)"
     }
   ]
 }
