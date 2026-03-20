@@ -236,37 +236,8 @@ def _build_window_status_board(skill_file, dry_run=False):
 
     momentum = get_momentum(ASSET, SIGNAL_SOURCE, LOOKBACK_MINUTES)
 
-    best_question = None
-    best_slug = None
-    try:
-        markets = discover_fast_market_markets(ASSET, WINDOW)
-        best_market = find_best_fast_market(markets)
-        if best_market:
-            best_question = best_market.get("question")
-            best_slug = best_market.get("slug")
-    except Exception:
-        best_question = None
-        best_slug = None
-
-    reference_price = _get_window_price_to_beat(
-        ASSET,
-        WINDOW,
-        window_key,
-        slug=best_slug,
-        question=best_question,
-    )
-
     session_state = _load_paper_state(skill_file) if dry_run else _load_daily_spend(skill_file)
     session_trades = int(session_state.get("trades", 0) or 0)
-
-    if dry_run:
-        paper_state = _load_paper_state(skill_file)
-        pnl_total = float(paper_state.get("realized_pnl", 0.0) or 0.0)
-        roi_pct = None
-    else:
-        live_snapshot = _get_live_pnl_snapshot(skill_file)
-        pnl_total = live_snapshot.get("pnl_total") if live_snapshot else None
-        roi_pct = _extract_live_roi_pct(live_snapshot)
 
     macd_line = momentum.get("macd_line") if momentum else None
     macd_signal = momentum.get("macd_signal") if momentum else None
@@ -278,14 +249,9 @@ def _build_window_status_board(skill_file, dry_run=False):
 
     lines = [
         f"📋 {ASSET} {WINDOW} | Market {_format_window_label_et(start_et, end_et)}",
-        f"  Price to beat:   ${reference_price:,.2f}" if reference_price is not None else "  Price to beat:   unavailable",
+        f"  Window skips:    {skip_text}",
         f"  Session trades:  {session_trades}",
     ]
-    if pnl_total is not None:
-        roi_txt = f" | ROI {roi_pct:+.2f}%" if roi_pct is not None else ""
-        lines.append(f"  Total P&L:       ${float(pnl_total):+.2f} USDC{roi_txt}")
-    else:
-        lines.append("  Total P&L:       unavailable")
 
     if macd_line is not None and macd_signal is not None and macd_hist is not None:
         lines.append(
@@ -294,7 +260,6 @@ def _build_window_status_board(skill_file, dry_run=False):
     else:
         lines.append("  MACD(12,26,9):   unavailable")
 
-    lines.append(f"  Window skips:    {skip_text}")
     return "\n".join(lines)
 
 
@@ -372,7 +337,7 @@ MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
-MOMENTUM_MAX_ENTRY = 0.35
+MOMENTUM_MAX_ENTRY = 0.45
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -2252,7 +2217,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below 0.35 | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      momentum only below 0.45 | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2917,3 +2882,4 @@ if __name__ == "__main__":
         if not ACTION_ONLY_LOGS:
             print(f"\n⏳ Waiting {sleep_seconds} seconds before next scan...\n")
         time.sleep(sleep_seconds)
+
