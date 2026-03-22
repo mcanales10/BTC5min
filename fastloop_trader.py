@@ -288,7 +288,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.02, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "entry_score_threshold": {"default": 0.62, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
+    "entry_score_threshold": {"default": 0.55, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
                          "help": "Minimum multi-factor entry score required to trade (0-1)"},
     "max_position": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
@@ -337,7 +337,7 @@ MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
-MOMENTUM_MAX_ENTRY = 0.60
+MOMENTUM_MAX_ENTRY = 0.65
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -2217,7 +2217,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below 0.60 | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      momentum only below 0.65 | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
