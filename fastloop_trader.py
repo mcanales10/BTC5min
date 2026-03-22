@@ -2022,14 +2022,34 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
     spread_score = _clamp01(1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6)))
     volume_score = _clamp01((volume_ratio - MIN_VOLUME_RATIO) / 1.40)
 
-    imbalance_score = 0.45
+    # Passive order-book imbalance is treated as a trap warning, not a bullish boost.
+    # Heavy resting bids on the side we want to buy often mean trapped/stale liquidity.
+    bid_share = None
+    imbalance_penalty = 0.0
+    imbalance_score = 0.55
+    imbalance_flag = "neutral"
     if side_book:
         bid_depth = float(side_book.get("bid_depth_usd") or 0.0)
         ask_depth = float(side_book.get("ask_depth_usd") or 0.0)
         total_depth = bid_depth + ask_depth
         if total_depth > 0:
             bid_share = bid_depth / total_depth
-            imbalance_score = _clamp01((bid_share - 0.45) / 0.25)
+            if bid_share >= 0.80:
+                imbalance_penalty = 1.00
+                imbalance_score = 0.00
+                imbalance_flag = "extreme"
+            elif bid_share >= 0.70:
+                imbalance_penalty = 0.70
+                imbalance_score = 0.15
+                imbalance_flag = "strong"
+            elif bid_share >= 0.60:
+                imbalance_penalty = 0.40
+                imbalance_score = 0.30
+                imbalance_flag = "moderate"
+            else:
+                imbalance_penalty = 0.0
+                imbalance_score = 0.55
+                imbalance_flag = "neutral"
 
     time_score = _clamp01((float(seconds_left or 0.0) - float(MIN_TIME_REMAINING)) / max(1.0, 240.0 - float(MIN_TIME_REMAINING)))
     edge_score = _clamp01((float(divergence) - float(min_divergence)) / 0.08)
@@ -2063,6 +2083,9 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
         "time": round(time_score, 3),
         "edge": round(edge_score, 3),
         "slippage": round(slippage_score, 3),
+        "imbalance_bid_share": round(float(bid_share), 3) if bid_share is not None else None,
+        "imbalance_penalty": round(float(imbalance_penalty), 3),
+        "imbalance_flag": imbalance_flag,
     }
     score = sum(weights[k] * details[k] for k in weights)
     details["score"] = round(score, 3)
@@ -2600,11 +2623,27 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         note_skip("insufficient edge")
         _emit_skip_report()
         return
+
+    # Extreme passive bid support on the side we want to buy is treated as a trap
+    # unless price/momentum confirmation is unusually strong.
+    if score_details.get("imbalance_flag") == "extreme" and (
+        score_details["momentum"] < 0.80 or
+        score_details["acceleration"] < 0.65 or
+        score_details["edge"] < 0.70
+    ):
+        log(
+            f"  ⏸️  Extreme imbalance trap: bid share {score_details.get('imbalance_bid_share')} | "
+            f"mom {score_details['momentum']:.2f} | accel {score_details['acceleration']:.2f} | edge {score_details['edge']:.2f}"
+        )
+        note_skip("imbalance trap")
+        _emit_skip_report()
+        return
+
     if score < ENTRY_SCORE_THRESHOLD:
         log(
             f"  ⏸️  Score {score:.2f} < threshold {ENTRY_SCORE_THRESHOLD:.2f} "
             f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}, "
-            f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}, time {score_details['time']:.2f}, "
+            f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}, time {score_details['time']:.2f}, "
             f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
         )
         note_skip("entry score too low")
@@ -2618,7 +2657,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # We have a signal!
     position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
 
-    log(f"  Strategy mode:   {strategy_mode} | score {score:.2f}/{ENTRY_SCORE_THRESHOLD:.2f}")
+    log(
+        f"  Strategy mode:   {strategy_mode} | score {score:.2f}/{ENTRY_SCORE_THRESHOLD:.2f} | "
+        f"imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}"
+    )
     log(
         f"  Score factors:   mom {score_details['momentum']:.2f} | accel {score_details['acceleration']:.2f} | "
         f"spread {score_details['spread']:.2f} | vol {score_details['volume']:.2f} | imb {score_details['imbalance']:.2f} | "
