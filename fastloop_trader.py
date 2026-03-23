@@ -94,6 +94,33 @@ def _format_window_label_et(start_et, end_et):
     return f"{_fmt(start_et)}-{_fmt(end_et)} ET"
 
 
+def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=90):
+    """Keep only the current 5m window and the immediately next one.
+
+    This prevents the bot from repeatedly scanning far-future markets that are
+    guaranteed to be "not live yet" and inflating skip counts.
+    """
+    if not markets:
+        return markets
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    _, start_et, end_et = _current_window_bounds_et(now_et)
+    next_end_et = end_et + timedelta(minutes=5)
+    target_ends = [end_et.astimezone(timezone.utc), next_end_et.astimezone(timezone.utc)]
+
+    filtered = []
+    for m in markets:
+        end_time = m.get("end_time")
+        if end_time is None:
+            continue
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        if any(abs((end_time - target).total_seconds()) <= tolerance_seconds for target in target_ends):
+            filtered.append(m)
+
+    return filtered or markets
+
+
 def _render_time_left_bar(now_et, start_et, end_et, width=10):
     total = max(1, int((end_et - start_et).total_seconds()))
     remaining = max(0, int((end_et - now_et).total_seconds()))
@@ -342,7 +369,7 @@ CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
 SCAN_INTERVAL_SECONDS = 30
-LIVE_SCAN_INTERVAL_SECONDS = 15  # faster loop while running in live mode
+LIVE_SCAN_INTERVAL_SECONDS = 5  # scan the current live market more aggressively while flat in live mode
 FOCUSED_LIVE_SCAN_INTERVAL_SECONDS = 5  # tighter management cadence while a live position/lock is active
 WINDOW_BOARD_INTERVAL_SECONDS = 300  # emit one status board per 5-minute market window
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
@@ -2385,7 +2412,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 1: Discover fast markets
     log(f"\n🔍 Discovering {ASSET} fast markets...")
     markets = discover_fast_market_markets(ASSET, WINDOW)
-    log(f"  Found {len(markets)} active fast markets")
+    markets = _filter_to_current_next_windows(markets)
+    log(f"  Found {len(markets)} current/next-window fast markets")
 
     # Look up fee rate once per run from a sample token (same window = same fee tier)
     if markets:
