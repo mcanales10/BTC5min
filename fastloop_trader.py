@@ -1835,29 +1835,43 @@ def _parse_fast_market_end_time(question):
         return None
 
 
+def classify_fast_market_rejection(market, now=None):
+    """Explain why a discovered fast market is not currently tradeable."""
+    now = now or datetime.now(timezone.utc)
+    max_remaining = _window_seconds.get(WINDOW, 300) * 2
+
+    if market.get("is_live_now") is not None:
+        if not market.get("is_live_now"):
+            return "not live yet"
+        end_time = market.get("end_time")
+        if not end_time:
+            return "missing end time"
+        remaining = (end_time - now).total_seconds()
+        if remaining <= MIN_TIME_REMAINING:
+            return "too little time left"
+        return None
+
+    end_time = market.get("end_time")
+    if not end_time:
+        return "missing end time"
+    remaining = (end_time - now).total_seconds()
+    if remaining <= MIN_TIME_REMAINING:
+        return "too little time left"
+    if remaining >= max_remaining:
+        return "too far away"
+    return None
+
+
 def find_best_fast_market(markets):
     """Pick the best fast_market to trade: live now, soonest expiring, enough time remaining."""
     now = datetime.now(timezone.utc)
-    max_remaining = _window_seconds.get(WINDOW, 300) * 2
     candidates = []
     for m in markets:
-        # Prefer is_live_now flag from Simmer API (reliable, server-computed)
-        if m.get("is_live_now") is not None:
-            if not m["is_live_now"]:
-                continue  # Not live yet — skip
+        reason = classify_fast_market_rejection(m, now=now)
+        if reason is None:
             end_time = m.get("end_time")
-            if end_time:
-                remaining = (end_time - now).total_seconds()
-                if remaining > MIN_TIME_REMAINING:
-                    candidates.append((remaining, m))
-        else:
-            # Gamma fallback: use time-based filtering
-            end_time = m.get("end_time")
-            if not end_time:
-                continue
             remaining = (end_time - now).total_seconds()
-            if remaining > MIN_TIME_REMAINING and remaining < max_remaining:
-                candidates.append((remaining, m))
+            candidates.append((remaining, m))
 
     if not candidates:
         return None
@@ -2397,16 +2411,30 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 2: Find best fast_market to trade
     best = find_best_fast_market(markets)
     if not best:
-        # Show what we skipped so users understand the gap
         now = datetime.now(timezone.utc)
+        breakdown_recorded = False
         for m in markets:
-            end_time = m.get("end_time")
-            if m.get("is_live_now") is False:
-                log(f"  Skipped: {m['question'][:50]}... (not live yet)")
-            elif end_time:
-                secs_left = (end_time - now).total_seconds()
-                log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
-        note_skip("no live tradeable market")
+            reason = classify_fast_market_rejection(m, now=now)
+            if reason:
+                note_skip(reason)
+                breakdown_recorded = True
+                if not quiet and not ACTION_ONLY_LOGS:
+                    if reason == "not live yet":
+                        log(f"  Skipped: {m['question'][:50]}... (not live yet)")
+                    elif reason == "too little time left":
+                        end_time = m.get("end_time")
+                        if end_time:
+                            secs_left = (end_time - now).total_seconds()
+                            log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
+                    elif reason == "missing end time":
+                        log(f"  Skipped: {m['question'][:50]}... (missing end time)")
+                    elif reason == "too far away":
+                        end_time = m.get("end_time")
+                        if end_time:
+                            secs_left = (end_time - now).total_seconds()
+                            log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left >= future-window cap)")
+        if not breakdown_recorded:
+            note_skip("no live tradeable market")
         log(f"  No live tradeable markets among {len(markets)} found — waiting for next window")
         if not quiet and not ACTION_ONLY_LOGS:
             print(f"📊 Summary: No tradeable markets (0/{len(markets)} live with enough time)")
