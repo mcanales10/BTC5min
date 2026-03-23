@@ -118,7 +118,7 @@ def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=90)
         if any(abs((end_time - target).total_seconds()) <= tolerance_seconds for target in target_ends):
             filtered.append(m)
 
-    return filtered or markets
+    return filtered
 
 
 def _render_time_left_bar(now_et, start_et, end_et, width=10):
@@ -2440,28 +2440,21 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     best = find_best_fast_market(markets)
     if not best:
         now = datetime.now(timezone.utc)
-        breakdown_recorded = False
+        reasons = []
         for m in markets:
             reason = classify_fast_market_rejection(m, now=now)
             if reason:
-                note_skip(reason)
-                breakdown_recorded = True
-                if not quiet and not ACTION_ONLY_LOGS:
-                    if reason == "not live yet":
-                        log(f"  Skipped: {m['question'][:50]}... (not live yet)")
-                    elif reason == "too little time left":
-                        end_time = m.get("end_time")
-                        if end_time:
-                            secs_left = (end_time - now).total_seconds()
-                            log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
-                    elif reason == "missing end time":
-                        log(f"  Skipped: {m['question'][:50]}... (missing end time)")
-                    elif reason == "too far away":
-                        end_time = m.get("end_time")
-                        if end_time:
-                            secs_left = (end_time - now).total_seconds()
-                            log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left >= future-window cap)")
-        if not breakdown_recorded:
+                reasons.append(reason)
+
+        if reasons:
+            priority = ["not live yet", "too little time left", "missing end time", "too far away"]
+            chosen = None
+            for p in priority:
+                if p in reasons:
+                    chosen = p
+                    break
+            note_skip(chosen or reasons[0])
+        else:
             note_skip("no live tradeable market")
         log(f"  No live tradeable markets among {len(markets)} found — waiting for next window")
         if not quiet and not ACTION_ONLY_LOGS:
