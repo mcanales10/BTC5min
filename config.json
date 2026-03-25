@@ -1,7 +1,7 @@
 {
   "entry_threshold": 0.05,
   "min_momentum_pct": 0.02,
-  "entry_score_threshold": 0.55,
+  "entry_score_threshold": 0.50,
   "max_position": 2.50,
   "max_open_exposure": 2.50,
   "lookback_minutes": 5,
