@@ -364,7 +364,7 @@ MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
-MOMENTUM_MAX_ENTRY = 0.75
+MOMENTUM_MAX_ENTRY = 0.80
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -377,6 +377,11 @@ _last_window_board_key = None
 _last_auto_redeem_ts = 0
 AUTO_REDEEM_INTERVAL_SECONDS = 900
 AUTO_REDEEM_BACKOFF_ON_429_SECONDS = 1800
+FAST_MARKETS_BACKOFF_SECONDS = 120
+FAST_MARKETS_CACHE_SECONDS = 60
+_last_fast_markets_good = {"ts": 0.0, "asset": None, "window": None, "markets": []}
+_fast_markets_backoff_until = 0.0
+_fast_markets_last_warn_key = None
 _skip_reason_counts = {}
 _window_reference_prices = {}
 _window_price_to_beat_meta = {}
@@ -1750,9 +1755,58 @@ def _get_live_current_side_price(pos, side, runtime_state=None):
 # Sprint Market Discovery
 # =============================================================================
 
+def _get_cached_fast_markets(asset, window):
+    global _last_fast_markets_good
+    try:
+        cached = _last_fast_markets_good or {}
+        if cached.get("asset") != asset or cached.get("window") != window:
+            return []
+        ts = float(cached.get("ts") or 0.0)
+        if time.time() - ts > FAST_MARKETS_CACHE_SECONDS:
+            return []
+        markets = cached.get("markets") or []
+        return [dict(m) for m in markets]
+    except Exception:
+        return []
+
+
+def _set_cached_fast_markets(asset, window, markets):
+    global _last_fast_markets_good
+    _last_fast_markets_good = {
+        "ts": time.time(),
+        "asset": asset,
+        "window": window,
+        "markets": [dict(m) for m in (markets or [])],
+    }
+
+
+def _maybe_log_fast_markets_fallback(message):
+    global _fast_markets_last_warn_key
+    key = str(message)
+    if _fast_markets_last_warn_key == key:
+        return
+    print(message)
+    _fast_markets_last_warn_key = key
+
+
 def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets via Simmer API (pre-imported, reliable).
-    Falls back to Gamma API if Simmer returns no results."""
+    """Find active fast markets via Simmer API with backoff/cache.
+    Falls back to Gamma API when Simmer is temporarily unavailable.
+    """
+    global _fast_markets_backoff_until, _fast_markets_last_warn_key
+
+    now_ts = time.time()
+
+    # If Simmer recently 502'd, avoid hammering it and rely on cached/Gamma data.
+    if now_ts < _fast_markets_backoff_until:
+        cached = _get_cached_fast_markets(asset, window)
+        if cached:
+            return cached
+        _maybe_log_fast_markets_fallback(
+            f"  ⚠️  Simmer fast-markets API backoff active for {int(_fast_markets_backoff_until - now_ts)}s — using Gamma fallback"
+        )
+        return _discover_via_gamma(asset, window)
+
     # Primary: Simmer's /api/sdk/fast-markets (markets already imported, is_live_now computed)
     try:
         client = get_client()
@@ -1760,14 +1814,13 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
         if sdk_markets:
             markets = []
             for m in sdk_markets:
-                # Parse resolves_at string to datetime for time calculations
                 end_time = _parse_resolves_at(m.resolves_at) if m.resolves_at else None
                 clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
                 if m.polymarket_no_token_id:
                     clob_tokens.append(m.polymarket_no_token_id)
                 markets.append({
                     "question": m.question,
-                    "market_id": m.id,  # Already imported — no import step needed
+                    "market_id": m.id,
                     "slug": getattr(m, "slug", None),
                     "end_time": end_time,
                     "clob_token_ids": clob_tokens,
@@ -1775,16 +1828,30 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
                     "spread_cents": m.spread_cents,
                     "liquidity_tier": m.liquidity_tier,
                     "external_price_yes": m.external_price_yes,
-                    "fee_rate_bps": getattr(m, 'fee_rate_bps', 0),  # Filled by dynamic lookup after discovery
+                    "fee_rate_bps": getattr(m, 'fee_rate_bps', 0),
                     "source": "simmer",
                 })
+            _set_cached_fast_markets(asset, window, markets)
+            _fast_markets_last_warn_key = None
             return markets
     except Exception as e:
-        print(f"  ⚠️  Simmer fast-markets API failed ({e}), falling back to Gamma")
+        msg = str(e)
+        if "502" in msg or "Bad Gateway" in msg:
+            _fast_markets_backoff_until = now_ts + FAST_MARKETS_BACKOFF_SECONDS
+            _maybe_log_fast_markets_fallback(
+                f"  ⚠️  Simmer fast-markets API failed ({e}), backing off {FAST_MARKETS_BACKOFF_SECONDS}s and using Gamma"
+            )
+        else:
+            _maybe_log_fast_markets_fallback(
+                f"  ⚠️  Simmer fast-markets API failed ({e}), falling back to Gamma"
+            )
 
-    # Fallback: Gamma API (may return stale data)
+    # Fallback order: recent good Simmer snapshot first, then Gamma.
+    cached = _get_cached_fast_markets(asset, window)
+    if cached:
+        return cached
+
     return _discover_via_gamma(asset, window)
-
 
 def _discover_via_gamma(asset="BTC", window="5m"):
     """Fallback: Find active fast markets on Polymarket via Gamma API."""
