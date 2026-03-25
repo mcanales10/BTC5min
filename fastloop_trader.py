@@ -364,7 +364,7 @@ MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
-MOMENTUM_MAX_ENTRY = 0.65
+MOMENTUM_MAX_ENTRY = 0.70
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -375,6 +375,8 @@ WINDOW_BOARD_INTERVAL_SECONDS = 300  # emit one status board per 5-minute market
 ACTION_ONLY_LOGS = True  # suppress scan/no-trade chatter; only actions/errors print
 _last_window_board_key = None
 _last_auto_redeem_ts = 0
+AUTO_REDEEM_INTERVAL_SECONDS = 900
+AUTO_REDEEM_BACKOFF_ON_429_SECONDS = 1800
 _skip_reason_counts = {}
 _window_reference_prices = {}
 _window_price_to_beat_meta = {}
@@ -434,8 +436,8 @@ RESOLUTION_EXIT_SECONDS = cfg["resolution_exit_seconds"]
 
 # Polymarket crypto fee formula constants (from docs.polymarket.com/trading/fees)
 # fee = C × p × POLY_FEE_RATE × (p × (1-p))^POLY_FEE_EXPONENT
-POLY_FEE_RATE = 0.25       # Crypto markets
-POLY_FEE_EXPONENT = 2      # Crypto markets
+POLY_FEE_RATE = 0.072      # Crypto markets (effective Mar 30, 2026 per user-provided fee schedule)
+POLY_FEE_EXPONENT = 1      # Crypto markets (effective Mar 30, 2026 per user-provided fee schedule)
 
 
 # =============================================================================
@@ -2281,7 +2283,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below 0.65 | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      momentum only below {MOMENTUM_MAX_ENTRY:.2f} | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2338,7 +2340,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if not dry_run:
         global _last_auto_redeem_ts
         now_redeem_ts = time.time()
-        if now_redeem_ts - _last_auto_redeem_ts >= 180:
+        session_trade_count = int(live_spend.get("trades", 0) or 0)
+        should_attempt_redeem = session_trade_count > 0
+        if should_attempt_redeem and (now_redeem_ts - _last_auto_redeem_ts >= AUTO_REDEEM_INTERVAL_SECONDS):
             try:
                 redeem_results = get_client().auto_redeem()
                 _last_auto_redeem_ts = now_redeem_ts
@@ -2346,7 +2350,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
                 if redeemed:
                     log(f"  ✅ Auto-redeemed {len(redeemed)} resolved winning position(s).", force=True)
             except Exception as e:
-                _last_auto_redeem_ts = now_redeem_ts
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    _last_auto_redeem_ts = now_redeem_ts + (AUTO_REDEEM_BACKOFF_ON_429_SECONDS - AUTO_REDEEM_INTERVAL_SECONDS)
+                else:
+                    _last_auto_redeem_ts = now_redeem_ts
                 log(f"  ⚠️  Auto-redeem skipped: {e}")
 
     # Manage exits before looking for fresh entries
