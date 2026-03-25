@@ -315,7 +315,7 @@ CONFIG_SCHEMA = {
                         "help": "Min price divergence from 50¢ to trigger trade"},
     "min_momentum_pct": {"default": 0.02, "env": "SIMMER_SPRINT_MOMENTUM", "type": float,
                          "help": "Min BTC % move in lookback window to trigger"},
-    "entry_score_threshold": {"default": 0.55, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
+    "entry_score_threshold": {"default": 0.50, "env": "SIMMER_SPRINT_SCORE_THRESHOLD", "type": float,
                          "help": "Minimum multi-factor entry score required to trade (0-1)"},
     "max_position": {"default": 2.5, "env": "SIMMER_SPRINT_MAX_POSITION", "type": float,
                      "help": "Max $ per trade"},
