@@ -364,7 +364,9 @@ MIN_VOLUME_RATIO = 0.20
 MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
-MOMENTUM_MAX_ENTRY = 0.90
+VALUE_MODE_MAX_ENTRY = 0.55
+MOMENTUM_MAX_ENTRY = 0.95
+CONTINUATION_SCORE_THRESHOLD = 0.45
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -2350,7 +2352,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      momentum only below {MOMENTUM_MAX_ENTRY:.2f} | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      value mode below ${VALUE_MODE_MAX_ENTRY:.2f} | continuation mode up to ${MOMENTUM_MAX_ENTRY:.2f} with strong MACD/momentum | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2710,6 +2712,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Entry price / strategy-mode filter (still a hard safety guard).
     strategy_mode = None
+    required_score_threshold = ENTRY_SCORE_THRESHOLD
     if price < MIN_ENTRY_PRICE or price > MAX_ENTRY_PRICE:
         log(f"  ⏸️  Entry price ${price:.3f} outside global allowed range")
         note_skip("price filter")
@@ -2722,10 +2725,43 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
-    if price < MOMENTUM_MAX_ENTRY:
-        strategy_mode = "momentum"
+    recent_momentum_pct = float(momentum.get("recent_momentum_pct", 0.0) or 0.0)
+    recent_aligned = ((side == "yes" and recent_momentum_pct > 0) or (side == "no" and recent_momentum_pct < 0))
+    macd_bias = str(momentum.get("macd_bias") or "").upper()
+    macd_aligned = ((side == "yes" and macd_bias == "UP") or (side == "no" and macd_bias == "DOWN"))
+    continuation_momentum_min = max(0.04, MIN_MOMENTUM_PCT * 2.0)
+    continuation_spread_max = MAX_SPREAD_PCT * 0.85
+
+    if price <= VALUE_MODE_MAX_ENTRY:
+        strategy_mode = "momentum_value"
+    elif price <= MOMENTUM_MAX_ENTRY:
+        continuation_ok = (
+            momentum_pct >= continuation_momentum_min and
+            recent_aligned and
+            macd_aligned and
+            abs(float(momentum.get("acceleration_pct", 0.0) or 0.0)) >= 0.01
+        )
+        if side_book and side_book.get("spread_pct") is not None:
+            try:
+                if float(side_book.get("spread_pct") or 0.0) > continuation_spread_max:
+                    continuation_ok = False
+            except Exception:
+                pass
+        if continuation_ok:
+            strategy_mode = "continuation"
+            required_score_threshold = min(ENTRY_SCORE_THRESHOLD, CONTINUATION_SCORE_THRESHOLD)
+            divergence = abs(float(divergence))
+            trade_rationale += f" | continuation ok @ ${price:.3f}"
+        else:
+            log(
+                f"  ⏸️  Entry price ${price:.3f} above value zone; continuation confirmation missing "
+                f"(mom {momentum_pct:.3f}% / recent {recent_momentum_pct:+.3f}% / MACD {macd_bias})"
+            )
+            note_skip("price filter")
+            _emit_skip_report()
+            return
     else:
-        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for momentum mode (< ${MOMENTUM_MAX_ENTRY:.2f})")
+        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for momentum/continuation mode (< ${MOMENTUM_MAX_ENTRY:.2f})")
         note_skip("price filter")
         _emit_skip_report()
         return
@@ -2763,9 +2799,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
-    if score < ENTRY_SCORE_THRESHOLD:
+    if score < required_score_threshold:
         log(
-            f"  ⏸️  Score {score:.2f} < threshold {ENTRY_SCORE_THRESHOLD:.2f} "
+            f"  ⏸️  Score {score:.2f} < threshold {required_score_threshold:.2f} "
             f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}, "
             f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}, time {score_details['time']:.2f}, "
             f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
@@ -2782,7 +2818,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
 
     log(
-        f"  Strategy mode:   {strategy_mode} | score {score:.2f}/{ENTRY_SCORE_THRESHOLD:.2f} | "
+        f"  Strategy mode:   {strategy_mode} | score {score:.2f}/{required_score_threshold:.2f} | "
         f"imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}"
     )
     log(
