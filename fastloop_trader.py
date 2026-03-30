@@ -365,7 +365,9 @@ MAX_ENTRY_PRICE = 0.99
 SKIP_MIDDLE_LOW = 0.35
 SKIP_MIDDLE_HIGH = 0.65
 VALUE_MODE_MAX_ENTRY = 0.55
-MOMENTUM_MAX_ENTRY = 0.95
+NORMAL_MAX_ENTRY = 0.90
+CONTINUATION_MIN_ENTRY = 0.90
+CONTINUATION_MAX_ENTRY = 0.99
 CONTINUATION_SCORE_THRESHOLD = 0.45
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
@@ -2352,7 +2354,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      value mode below ${VALUE_MODE_MAX_ENTRY:.2f} | continuation mode up to ${MOMENTUM_MAX_ENTRY:.2f} with strong MACD/momentum | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      deep value below ${VALUE_MODE_MAX_ENTRY:.2f} | normal entries below ${NORMAL_MAX_ENTRY:.2f} | continuation ${CONTINUATION_MIN_ENTRY:.2f}-${CONTINUATION_MAX_ENTRY:.2f} with momentum + MACD + acceleration + spread agreement | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2729,17 +2731,55 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     recent_aligned = ((side == "yes" and recent_momentum_pct > 0) or (side == "no" and recent_momentum_pct < 0))
     macd_bias = str(momentum.get("macd_bias") or "").upper()
     macd_aligned = ((side == "yes" and macd_bias == "UP") or (side == "no" and macd_bias == "DOWN"))
+    acceleration_pct = float(momentum.get("acceleration_pct", 0.0) or 0.0)
+    acceleration_aligned = ((side == "yes" and acceleration_pct >= 0.0) or (side == "no" and acceleration_pct <= 0.0))
     continuation_momentum_min = max(0.04, MIN_MOMENTUM_PCT * 2.0)
     continuation_spread_max = MAX_SPREAD_PCT * 0.85
 
+    window_key, _, _ = _current_window_bounds_et(datetime.now(ZoneInfo("America/New_York")))
+    price_to_beat = _get_window_price_to_beat(
+        ASSET,
+        WINDOW,
+        window_key,
+        slug=best.get("slug"),
+        question=best.get("question"),
+    )
+    cex_vs_beat = None
+    beat_side_aligned = True
+    if price_to_beat is not None:
+        try:
+            cex_vs_beat = float(momentum["price_now"]) - float(price_to_beat)
+            beat_side_aligned = ((side == "yes" and cex_vs_beat >= 0) or (side == "no" and cex_vs_beat <= 0))
+            trade_rationale += f" | beat ${price_to_beat:,.2f} | CEX delta {cex_vs_beat:+.2f}"
+        except Exception:
+            cex_vs_beat = None
+            beat_side_aligned = True
+
     if price <= VALUE_MODE_MAX_ENTRY:
-        strategy_mode = "momentum_value"
-    elif price <= MOMENTUM_MAX_ENTRY:
+        strategy_mode = "deep_value"
+    elif price < NORMAL_MAX_ENTRY:
+        normal_ok = recent_aligned or macd_aligned or (beat_side_aligned and momentum_pct >= continuation_momentum_min)
+        if normal_ok:
+            strategy_mode = "normal"
+            divergence = abs(float(divergence))
+            trade_rationale += f" | normal ok @ ${price:.3f}"
+        else:
+            log(
+                f"  ⏸️  Normal entry ${price:.3f} missing confirmation "
+                f"(recent {recent_momentum_pct:+.3f}% / MACD {macd_bias} / beat {'ok' if beat_side_aligned else 'against'})"
+            )
+            note_skip("normal confirmation missing")
+            _emit_skip_report()
+            return
+    elif price <= CONTINUATION_MAX_ENTRY:
         continuation_ok = (
+            price >= CONTINUATION_MIN_ENTRY and
             momentum_pct >= continuation_momentum_min and
             recent_aligned and
             macd_aligned and
-            abs(float(momentum.get("acceleration_pct", 0.0) or 0.0)) >= 0.01
+            acceleration_aligned and
+            abs(acceleration_pct) >= 0.01 and
+            beat_side_aligned
         )
         if side_book and side_book.get("spread_pct") is not None:
             try:
@@ -2754,14 +2794,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             trade_rationale += f" | continuation ok @ ${price:.3f}"
         else:
             log(
-                f"  ⏸️  Entry price ${price:.3f} above value zone; continuation confirmation missing "
-                f"(mom {momentum_pct:.3f}% / recent {recent_momentum_pct:+.3f}% / MACD {macd_bias})"
+                f"  ⏸️  Continuation entry ${price:.3f} missing confirmation "
+                f"(mom {momentum_pct:.3f}% / recent {recent_momentum_pct:+.3f}% / accel {acceleration_pct:+.3f}% / MACD {macd_bias} / beat {'ok' if beat_side_aligned else 'against'})"
             )
-            note_skip("price filter")
+            note_skip("continuation confirmation missing")
             _emit_skip_report()
             return
     else:
-        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for momentum/continuation mode (< ${MOMENTUM_MAX_ENTRY:.2f})")
+        log(f"  ⏸️  Entry price ${price:.3f} outside allowed range for normal/continuation mode (<= ${CONTINUATION_MAX_ENTRY:.2f})")
         note_skip("price filter")
         _emit_skip_report()
         return
