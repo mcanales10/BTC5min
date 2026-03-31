@@ -2354,7 +2354,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      deep value below ${VALUE_MODE_MAX_ENTRY:.2f} | normal entries below ${NORMAL_MAX_ENTRY:.2f} | continuation ${CONTINUATION_MIN_ENTRY:.2f}-${CONTINUATION_MAX_ENTRY:.2f} with momentum + MACD + acceleration + spread agreement | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      deep value below ${VALUE_MODE_MAX_ENTRY:.2f} | normal entries below ${NORMAL_MAX_ENTRY:.2f} | continuation ${CONTINUATION_MIN_ENTRY:.2f}-${CONTINUATION_MAX_ENTRY:.2f} with relaxed momentum/acceleration, MACD + beat alignment, and normal spread cap | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2733,8 +2733,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     macd_aligned = ((side == "yes" and macd_bias == "UP") or (side == "no" and macd_bias == "DOWN"))
     acceleration_pct = float(momentum.get("acceleration_pct", 0.0) or 0.0)
     acceleration_aligned = ((side == "yes" and acceleration_pct >= 0.0) or (side == "no" and acceleration_pct <= 0.0))
-    continuation_momentum_min = max(0.04, MIN_MOMENTUM_PCT * 2.0)
-    continuation_spread_max = MAX_SPREAD_PCT * 0.85
+    continuation_momentum_min = max(0.03, MIN_MOMENTUM_PCT * 1.5)
+    continuation_acceleration_min = 0.005
+    continuation_spread_max = MAX_SPREAD_PCT
 
     window_key, _, _ = _current_window_bounds_et(datetime.now(ZoneInfo("America/New_York")))
     price_to_beat = _get_window_price_to_beat(
@@ -2764,40 +2765,64 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             divergence = abs(float(divergence))
             trade_rationale += f" | normal ok @ ${price:.3f}"
         else:
+            normal_failures = []
+            if not recent_aligned:
+                normal_failures.append("normal_recent")
+            if not macd_aligned:
+                normal_failures.append("normal_macd")
+            if not beat_side_aligned:
+                normal_failures.append("normal_beat")
+            if momentum_pct < continuation_momentum_min:
+                normal_failures.append("normal_momentum")
+            primary_reason = normal_failures[0] if normal_failures else "normal confirmation missing"
             log(
                 f"  ⏸️  Normal entry ${price:.3f} missing confirmation "
-                f"(recent {recent_momentum_pct:+.3f}% / MACD {macd_bias} / beat {'ok' if beat_side_aligned else 'against'})"
+                f"(recent {recent_momentum_pct:+.3f}% / MACD {macd_bias} / beat {'ok' if beat_side_aligned else 'against'} / "
+                f"mom {momentum_pct:.3f}% < {continuation_momentum_min:.3f}%? {'yes' if momentum_pct < continuation_momentum_min else 'no'})",
+                force=True,
             )
-            note_skip("normal confirmation missing")
+            note_skip(primary_reason)
             _emit_skip_report()
             return
     elif price <= CONTINUATION_MAX_ENTRY:
-        continuation_ok = (
-            price >= CONTINUATION_MIN_ENTRY and
-            momentum_pct >= continuation_momentum_min and
-            recent_aligned and
-            macd_aligned and
-            acceleration_aligned and
-            abs(acceleration_pct) >= 0.01 and
-            beat_side_aligned
-        )
+        continuation_failures = []
+        if price < CONTINUATION_MIN_ENTRY:
+            continuation_failures.append("cont_price_band")
+        if momentum_pct < continuation_momentum_min:
+            continuation_failures.append("cont_momentum")
+        if not macd_aligned:
+            continuation_failures.append("cont_macd")
+        if not acceleration_aligned:
+            continuation_failures.append("cont_accel_dir")
+        if abs(acceleration_pct) < continuation_acceleration_min:
+            continuation_failures.append("cont_accel_weak")
+        if not beat_side_aligned:
+            continuation_failures.append("cont_beat")
+        side_spread_pct = None
         if side_book and side_book.get("spread_pct") is not None:
             try:
-                if float(side_book.get("spread_pct") or 0.0) > continuation_spread_max:
-                    continuation_ok = False
+                side_spread_pct = float(side_book.get("spread_pct") or 0.0)
+                if side_spread_pct > continuation_spread_max:
+                    continuation_failures.append("cont_spread")
             except Exception:
-                pass
+                side_spread_pct = None
+        continuation_ok = not continuation_failures
         if continuation_ok:
             strategy_mode = "continuation"
             required_score_threshold = min(ENTRY_SCORE_THRESHOLD, CONTINUATION_SCORE_THRESHOLD)
             divergence = abs(float(divergence))
             trade_rationale += f" | continuation ok @ ${price:.3f}"
         else:
+            primary_reason = continuation_failures[0]
+            spread_text = f"{side_spread_pct:.3%}" if side_spread_pct is not None else "n/a"
             log(
-                f"  ⏸️  Continuation entry ${price:.3f} missing confirmation "
-                f"(mom {momentum_pct:.3f}% / recent {recent_momentum_pct:+.3f}% / accel {acceleration_pct:+.3f}% / MACD {macd_bias} / beat {'ok' if beat_side_aligned else 'against'})"
+                f"  ⏸️  Continuation entry ${price:.3f} blocked: {', '.join(continuation_failures)} "
+                f"(mom {momentum_pct:.3f}% vs {continuation_momentum_min:.3f}% / recent {recent_momentum_pct:+.3f}% / "
+                f"accel {acceleration_pct:+.3f}% vs {continuation_acceleration_min:.3f}% / MACD {macd_bias} / "
+                f"beat {'ok' if beat_side_aligned else 'against'} / spread {spread_text} vs {continuation_spread_max:.3%})",
+                force=True,
             )
-            note_skip("continuation confirmation missing")
+            note_skip(primary_reason)
             _emit_skip_report()
             return
     else:
