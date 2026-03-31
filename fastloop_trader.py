@@ -369,6 +369,8 @@ NORMAL_MAX_ENTRY = 0.90
 CONTINUATION_MIN_ENTRY = 0.90
 CONTINUATION_MAX_ENTRY = 0.99
 CONTINUATION_SCORE_THRESHOLD = 0.45
+CONTINUATION_EXTREME_PRICE_THRESHOLD = 0.97
+EXTREME_ENTRY_MAX_PREMIUM_PCT = 0.03
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -1588,6 +1590,62 @@ def fetch_side_orderbook_summary(clob_token_ids, side="yes"):
         return None
 
 
+def _evaluate_entry_liquidity(side, market_yes_price, side_price, entry_price, yes_book=None, side_book=None):
+    """Use a saner liquidity guard for expensive continuation entries.
+
+    Near 0.97-0.99, the side-token bid can sit far away and make the raw side-book
+    spread look absurd even when the current best ask is still reasonably close to
+    the live midpoint. In that regime, judge entry quality by ask premium over the
+    live midpoint first, and only fall back to raw spread if needed.
+    """
+    yes_spread_pct = None
+    side_spread_pct = None
+    ask_premium_pct = None
+    basis = "side_book"
+
+    try:
+        if yes_book and yes_book.get("spread_pct") is not None:
+            yes_spread_pct = float(yes_book.get("spread_pct") or 0.0)
+    except Exception:
+        yes_spread_pct = None
+
+    try:
+        if side_book and side_book.get("spread_pct") is not None:
+            side_spread_pct = float(side_book.get("spread_pct") or 0.0)
+    except Exception:
+        side_spread_pct = None
+
+    try:
+        best_ask = float(side_book.get("best_ask")) if side_book and side_book.get("best_ask") is not None else None
+        if best_ask is not None and side_price and side_price > 0:
+            ask_premium_pct = max(0.0, (best_ask - float(side_price)) / float(side_price))
+    except Exception:
+        ask_premium_pct = None
+
+    is_extreme = float(entry_price or 0.0) >= CONTINUATION_EXTREME_PRICE_THRESHOLD
+    effective_spread_pct = side_spread_pct
+
+    if is_extreme:
+        if ask_premium_pct is not None:
+            effective_spread_pct = ask_premium_pct
+            basis = "ask_premium"
+        elif yes_spread_pct is not None:
+            effective_spread_pct = yes_spread_pct
+            basis = "yes_book_fallback"
+    elif effective_spread_pct is None and yes_spread_pct is not None:
+        effective_spread_pct = yes_spread_pct
+        basis = "yes_book_fallback"
+
+    return {
+        "is_extreme": is_extreme,
+        "yes_spread_pct": yes_spread_pct,
+        "side_spread_pct": side_spread_pct,
+        "ask_premium_pct": ask_premium_pct,
+        "effective_spread_pct": effective_spread_pct,
+        "basis": basis,
+    }
+
+
 def _normalize_dict_like(obj):
     if obj is None:
         return None
@@ -2113,7 +2171,7 @@ def _clamp01(value):
         return 0.0
 
 
-def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left, yes_book=None, side_book=None, side_price=None):
+def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left, yes_book=None, side_book=None, side_price=None, effective_spread_pct=None, spread_basis=None):
     """Multi-factor entry score for fast markets. Returns (score, details)."""
     momentum_pct = abs(float(momentum.get("momentum_pct", 0.0) or 0.0))
     recent_pct = abs(float(momentum.get("recent_momentum_pct", 0.0) or 0.0))
@@ -2123,6 +2181,11 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
 
     spread_source = side_book or yes_book or {}
     spread_pct = float(spread_source.get("spread_pct") or 0.0) if spread_source else 0.0
+    if effective_spread_pct is not None:
+        try:
+            spread_pct = float(effective_spread_pct)
+        except Exception:
+            pass
 
     # Momentum strength prefers moves well above the floor.
     momentum_score = _clamp01((momentum_pct - MIN_MOMENTUM_PCT) / max(0.0001, 0.30 - MIN_MOMENTUM_PCT))
@@ -2205,6 +2268,7 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
     details["score"] = round(score, 3)
     details["threshold"] = round(ENTRY_SCORE_THRESHOLD, 3)
     details["spread_pct"] = round(spread_pct, 4)
+    details["spread_basis"] = spread_basis or ("side_book" if side_book else "yes_book")
     details["volume_ratio"] = round(volume_ratio, 3)
     details["divergence"] = round(float(divergence), 4)
     details["min_divergence"] = round(float(min_divergence), 4)
@@ -2736,6 +2800,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     continuation_momentum_min = max(0.03, MIN_MOMENTUM_PCT * 1.5)
     continuation_acceleration_min = 0.005
     continuation_spread_max = MAX_SPREAD_PCT
+    entry_liquidity = _evaluate_entry_liquidity(
+        side=side,
+        market_yes_price=market_yes_price,
+        side_price=buy_price_mid,
+        entry_price=price,
+        yes_book=book if 'book' in locals() else None,
+        side_book=side_book,
+    )
 
     window_key, _, _ = _current_window_bounds_et(datetime.now(ZoneInfo("America/New_York")))
     price_to_beat = _get_window_price_to_beat(
@@ -2798,14 +2870,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             continuation_failures.append("cont_accel_weak")
         if not beat_side_aligned:
             continuation_failures.append("cont_beat")
-        side_spread_pct = None
-        if side_book and side_book.get("spread_pct") is not None:
-            try:
-                side_spread_pct = float(side_book.get("spread_pct") or 0.0)
-                if side_spread_pct > continuation_spread_max:
-                    continuation_failures.append("cont_spread")
-            except Exception:
-                side_spread_pct = None
+        side_spread_pct = entry_liquidity.get("effective_spread_pct")
+        continuation_spread_limit = (
+            EXTREME_ENTRY_MAX_PREMIUM_PCT
+            if entry_liquidity.get("is_extreme") and entry_liquidity.get("basis") == "ask_premium"
+            else continuation_spread_max
+        )
+        try:
+            if side_spread_pct is not None and float(side_spread_pct) > float(continuation_spread_limit):
+                continuation_failures.append("cont_spread")
+        except Exception:
+            side_spread_pct = None
         continuation_ok = not continuation_failures
         if continuation_ok:
             strategy_mode = "continuation"
@@ -2815,11 +2890,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         else:
             primary_reason = continuation_failures[0]
             spread_text = f"{side_spread_pct:.3%}" if side_spread_pct is not None else "n/a"
+            raw_side_spread = entry_liquidity.get("side_spread_pct")
+            raw_side_spread_text = f"{raw_side_spread:.3%}" if raw_side_spread is not None else "n/a"
+            ask_premium = entry_liquidity.get("ask_premium_pct")
+            ask_premium_text = f"{ask_premium:.3%}" if ask_premium is not None else "n/a"
+            spread_basis = entry_liquidity.get("basis") or "side_book"
             log(
                 f"  ⏸️  Continuation entry ${price:.3f} blocked: {', '.join(continuation_failures)} "
                 f"(mom {momentum_pct:.3f}% vs {continuation_momentum_min:.3f}% / recent {recent_momentum_pct:+.3f}% / "
                 f"accel {acceleration_pct:+.3f}% vs {continuation_acceleration_min:.3f}% / MACD {macd_bias} / "
-                f"beat {'ok' if beat_side_aligned else 'against'} / spread {spread_text} vs {continuation_spread_max:.3%})",
+                f"beat {'ok' if beat_side_aligned else 'against'} / liquidity {spread_basis} {spread_text} vs {continuation_spread_limit:.3%} "
+                f"| askPrem {ask_premium_text} | rawSideSpread {raw_side_spread_text})",
                 force=True,
             )
             note_skip(primary_reason)
@@ -2840,6 +2921,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         yes_book=book if 'book' in locals() else None,
         side_book=side_book,
         side_price=buy_price_mid,
+        effective_spread_pct=entry_liquidity.get("effective_spread_pct") if entry_liquidity else None,
+        spread_basis=entry_liquidity.get("basis") if entry_liquidity else None,
     )
 
     # Require both a positive edge and a strong overall score.
@@ -2867,7 +2950,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if score < required_score_threshold:
         log(
             f"  ⏸️  Score {score:.2f} < threshold {required_score_threshold:.2f} "
-            f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}, "
+            f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}/{score_details.get('spread_basis')}, "
             f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}, time {score_details['time']:.2f}, "
             f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
         )
