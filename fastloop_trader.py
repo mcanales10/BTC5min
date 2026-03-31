@@ -94,8 +94,8 @@ def _format_window_label_et(start_et, end_et):
     return f"{_fmt(start_et)}-{_fmt(end_et)} ET"
 
 
-def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=90):
-    """Keep only the current 5m window and the immediately next one.
+def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=150, window_offsets=(0, 1)):
+    """Keep only the most relevant nearby 5m windows.
 
     This prevents the bot from repeatedly scanning far-future markets that are
     guaranteed to be "not live yet" and inflating skip counts.
@@ -104,9 +104,11 @@ def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=90)
         return markets
     now_utc = now_utc or datetime.now(timezone.utc)
     now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
-    _, start_et, end_et = _current_window_bounds_et(now_et)
-    next_end_et = end_et + timedelta(minutes=5)
-    target_ends = [end_et.astimezone(timezone.utc), next_end_et.astimezone(timezone.utc)]
+    _, _start_et, end_et = _current_window_bounds_et(now_et)
+    target_ends = []
+    for offset in tuple(window_offsets or (0, 1)):
+        target_end_et = end_et + timedelta(minutes=5 * int(offset))
+        target_ends.append(target_end_et.astimezone(timezone.utc))
 
     filtered = []
     for m in markets:
@@ -120,6 +122,41 @@ def _filter_to_current_next_windows(markets, now_utc=None, tolerance_seconds=90)
 
     return filtered
 
+
+def _select_candidate_fast_markets(markets, now_utc=None):
+    """Prefer current/next windows, but fall back to a looser band if discovery is late."""
+    if not markets:
+        return []
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    primary = _filter_to_current_next_windows(
+        markets,
+        now_utc=now_utc,
+        tolerance_seconds=150,
+        window_offsets=(0, 1),
+    )
+    if primary:
+        return primary
+
+    fallback_prev = _filter_to_current_next_windows(
+        markets,
+        now_utc=now_utc,
+        tolerance_seconds=240,
+        window_offsets=(-1, 0, 1),
+    )
+    if fallback_prev:
+        return fallback_prev
+
+    fallback_next = _filter_to_current_next_windows(
+        markets,
+        now_utc=now_utc,
+        tolerance_seconds=300,
+        window_offsets=(0, 1, 2),
+    )
+    if fallback_next:
+        return fallback_next
+
+    return []
 
 def _render_time_left_bar(now_et, start_et, end_et, width=10):
     total = max(1, int((end_et - start_et).total_seconds()))
@@ -367,10 +404,10 @@ SKIP_MIDDLE_HIGH = 0.65
 VALUE_MODE_MAX_ENTRY = 0.55
 NORMAL_MAX_ENTRY = 0.90
 CONTINUATION_MIN_ENTRY = 0.90
-CONTINUATION_MAX_ENTRY = 0.99
+CONTINUATION_MAX_ENTRY = 0.97
 CONTINUATION_SCORE_THRESHOLD = 0.45
 CONTINUATION_EXTREME_PRICE_THRESHOLD = 0.97
-EXTREME_ENTRY_MAX_PREMIUM_PCT = 0.03
+EXTREME_ENTRY_MAX_PREMIUM_PCT = 0.10
 CONTRARIAN_LOW = 0.15
 CONTRARIAN_HIGH = 0.85
 BAD_MARKET_COOLDOWN_CYCLES = 3
@@ -2171,7 +2208,7 @@ def _clamp01(value):
         return 0.0
 
 
-def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left, yes_book=None, side_book=None, side_price=None, effective_spread_pct=None, spread_basis=None):
+def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left, yes_book=None, side_book=None, side_price=None, effective_spread_pct=None, spread_basis=None, spread_cap_pct=None):
     """Multi-factor entry score for fast markets. Returns (score, details)."""
     momentum_pct = abs(float(momentum.get("momentum_pct", 0.0) or 0.0))
     recent_pct = abs(float(momentum.get("recent_momentum_pct", 0.0) or 0.0))
@@ -2196,7 +2233,8 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
     aligned_accel = acceleration_pct if direction == "up" else -acceleration_pct
     acceleration_score = _clamp01(0.55 * _clamp01(recent_pct / 0.08) * recent_aligned + 0.45 * _clamp01(aligned_accel / 0.06))
 
-    spread_score = _clamp01(1.0 - (spread_pct / max(MAX_SPREAD_PCT, 1e-6)))
+    spread_cap_pct = float(spread_cap_pct or MAX_SPREAD_PCT)
+    spread_score = _clamp01(1.0 - (spread_pct / max(spread_cap_pct, 1e-6)))
     volume_score = _clamp01((volume_ratio - MIN_VOLUME_RATIO) / 1.40)
 
     # Passive order-book imbalance is treated as a trap warning, not a bullish boost.
@@ -2269,6 +2307,7 @@ def _score_entry_setup(side, momentum, divergence, min_divergence, seconds_left,
     details["threshold"] = round(ENTRY_SCORE_THRESHOLD, 3)
     details["spread_pct"] = round(spread_pct, 4)
     details["spread_basis"] = spread_basis or ("side_book" if side_book else "yes_book")
+    details["spread_cap_pct"] = round(spread_cap_pct, 4)
     details["volume_ratio"] = round(volume_ratio, 3)
     details["divergence"] = round(float(divergence), 4)
     details["min_divergence"] = round(float(min_divergence), 4)
@@ -2418,7 +2457,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
-    log(f"  Entry rules:      deep value below ${VALUE_MODE_MAX_ENTRY:.2f} | normal entries below ${NORMAL_MAX_ENTRY:.2f} | continuation ${CONTINUATION_MIN_ENTRY:.2f}-${CONTINUATION_MAX_ENTRY:.2f} with relaxed momentum/acceleration, MACD + beat alignment, and normal spread cap | live min entry $0.12 | contrarian disabled")
+    log(f"  Entry rules:      deep value below ${VALUE_MODE_MAX_ENTRY:.2f} | normal entries below ${NORMAL_MAX_ENTRY:.2f} | continuation ${CONTINUATION_MIN_ENTRY:.2f}-${CONTINUATION_MAX_ENTRY:.2f} with relaxed momentum/acceleration, MACD + beat alignment, and capped premium guard ({EXTREME_ENTRY_MAX_PREMIUM_PCT:.0%} on extreme entries) | live min entry $0.12 | contrarian disabled")
     log(f"  TP/SL:            +{TAKE_PROFIT_PCT:.0%} / -{STOP_LOSS_PCT:.0%} | time-stop {LIVE_TIME_STOP_SECONDS}s | max-hold {LIVE_MAX_HOLD_SECONDS}s")
     log(f"  Daily stop:       -${DAILY_LOSS_LIMIT:.2f} then 24h pause")
     live_spend = _load_daily_spend(__file__)
@@ -2554,9 +2593,9 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Step 1: Discover fast markets
     log(f"\n🔍 Discovering {ASSET} fast markets...")
-    markets = discover_fast_market_markets(ASSET, WINDOW)
-    markets = _filter_to_current_next_windows(markets)
-    log(f"  Found {len(markets)} current/next-window fast markets")
+    raw_markets = discover_fast_market_markets(ASSET, WINDOW)
+    markets = _select_candidate_fast_markets(raw_markets)
+    log(f"  Found {len(markets)} candidate fast markets from {len(raw_markets)} discovered")
 
     # Look up fee rate once per run from a sample token (same window = same fee tier)
     if markets:
@@ -2912,6 +2951,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         _emit_skip_report()
         return
 
+    score_spread_cap = max(
+        MAX_SPREAD_PCT,
+        continuation_spread_limit if strategy_mode == "continuation" else MAX_SPREAD_PCT,
+    )
     score, score_details = _score_entry_setup(
         side=side,
         momentum=momentum,
@@ -2923,6 +2966,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         side_price=buy_price_mid,
         effective_spread_pct=entry_liquidity.get("effective_spread_pct") if entry_liquidity else None,
         spread_basis=entry_liquidity.get("basis") if entry_liquidity else None,
+        spread_cap_pct=score_spread_cap,
     )
 
     # Require both a positive edge and a strong overall score.
@@ -2950,7 +2994,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if score < required_score_threshold:
         log(
             f"  ⏸️  Score {score:.2f} < threshold {required_score_threshold:.2f} "
-            f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}/{score_details.get('spread_basis')}, "
+            f"(mom {score_details['momentum']:.2f}, accel {score_details['acceleration']:.2f}, spread {score_details['spread']:.2f}/{score_details.get('spread_basis')} cap {score_details.get('spread_cap_pct'):.2%}, "
             f"vol {score_details['volume']:.2f}, imb {score_details['imbalance']:.2f}/{score_details.get('imbalance_flag')}, time {score_details['time']:.2f}, "
             f"edge {score_details['edge']:.2f}, slip {score_details['slippage']:.2f})"
         )
